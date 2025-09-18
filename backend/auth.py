@@ -8,9 +8,8 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 import jwt
 from passlib.context import CryptContext
-
-# Simple in-memory user storage (in production, use a database)
-users_db: Dict[str, Dict] = {}
+from sqlalchemy.orm import Session
+from database import get_db, User
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -22,20 +21,9 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 class AuthService:
     def __init__(self):
-        # Create some default users for testing
-        self._create_default_users()
-    
-    def _create_default_users(self):
-        """Create default users for testing"""
-        default_users = [
-            {"username": "mom", "password": "mom123"},
-            {"username": "dad", "password": "dad123"},
-            {"username": "kid", "password": "kid123"}
-        ]
-        
-        for user in default_users:
-            if user["username"] not in users_db:
-                self.register(user["username"], user["password"])
+        # Auth service now only works with existing database users
+        # No default users are created
+        pass
     
     def hash_password(self, password: str) -> str:
         """Hash a password"""
@@ -67,30 +55,56 @@ class AuthService:
         except jwt.PyJWTError:
             raise Exception("Invalid token")
     
-    def register(self, username: str, password: str) -> bool:
+    def register(self, username: str, password: str, db: Session = None) -> bool:
         """Register a new user"""
-        if username in users_db:
-            raise Exception("Username already exists")
-        
-        hashed_password = self.hash_password(password)
-        users_db[username] = {
-            "username": username,
-            "password": hashed_password,
-            "created_at": datetime.utcnow().isoformat()
-        }
-        return True
+        if db is None:
+            db = next(get_db())
+            should_close = True
+        else:
+            should_close = False
+            
+        try:
+            existing_user = db.query(User).filter(User.username == username).first()
+            if existing_user:
+                raise Exception("Username already exists")
+            
+            hashed_password = self.hash_password(password)
+            new_user = User(
+                username=username,
+                passwordHash=hashed_password
+            )
+            db.add(new_user)
+            db.commit()
+            return True
+        finally:
+            if should_close:
+                db.close()
     
     def login(self, username: str, password: str) -> str:
         """Authenticate user and return JWT token"""
-        if username not in users_db:
-            raise Exception("Invalid username or password")
-        
-        user = users_db[username]
-        if not self.verify_password(password, user["password"]):
-            raise Exception("Invalid username or password")
-        
-        return self.create_access_token(username)
+        db = next(get_db())
+        try:
+            user = db.query(User).filter(User.username == username).first()
+            if not user:
+                raise Exception("Invalid username or password")
+            
+            if not self.verify_password(password, user.passwordHash):
+                raise Exception("Invalid username or password")
+            
+            return self.create_access_token(username)
+        finally:
+            db.close()
     
     def get_user(self, username: str) -> Optional[Dict]:
         """Get user by username"""
-        return users_db.get(username)
+        db = next(get_db())
+        try:
+            user = db.query(User).filter(User.username == username).first()
+            if user:
+                return {
+                    "username": user.username,
+                    "created_at": user.createdAt.isoformat() if user.createdAt else None
+                }
+            return None
+        finally:
+            db.close()
