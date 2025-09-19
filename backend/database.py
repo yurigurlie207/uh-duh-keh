@@ -6,6 +6,10 @@ from sqlalchemy import create_engine, Column, String, Boolean, Integer, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Database URL from environment variable
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/todo_db")
@@ -34,12 +38,13 @@ class Todo(Base):
     id = Column(String, primary_key=True, index=True)
     title = Column(String, nullable=False)
     completed = Column(Boolean, default=False)
-    priority = Column(Integer, default=999)
+    priority = Column(String, default="999")
     assignedTo = Column("assignedTo", String, nullable=True)
     createdAt = Column("createdAt", DateTime, default=datetime.utcnow)
     updatedAt = Column("updatedAt", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    aiPriority = Column("aiPriority", Integer, nullable=True)
-    aiReason = Column("aiReason", Text, nullable=True)
+    # Note: aiPriority and aiReason columns don't exist in your database
+    # aiPriority = Column("aiPriority", Integer, nullable=True)
+    # aiReason = Column("aiReason", Text, nullable=True)
 
 class UserPreferences(Base):
     __tablename__ = "user_preferences"

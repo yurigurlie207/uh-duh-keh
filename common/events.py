@@ -44,7 +44,7 @@ class TodoUpdateData(BaseModel):
     id: str
     title: Optional[str] = None
     completed: Optional[bool] = None
-    priority: Optional[int] = None
+    priority: Optional[str] = None
     assigned_to: Optional[str] = None
 
 
@@ -75,7 +75,7 @@ class Todo(BaseModel):
     id: str
     title: str
     completed: bool = False
-    priority: int = 999
+    priority: str = "999"
     assigned_to: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None

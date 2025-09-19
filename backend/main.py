@@ -8,6 +8,10 @@ import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Add the parent directory to the Python path to import common module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,7 +33,8 @@ from common.events import (
 
 # Initialize Socket.IO
 sio = socketio.AsyncServer(
-    cors_allowed_origins=["http://localhost:3000", "http://localhost:4200"],
+    cors_allowed_origins=["http://localhost:3000"],
+    cors_credentials=True,
     async_mode='asgi'
 )
 
@@ -50,8 +55,8 @@ def db_todo_to_pydantic(db_todo: TodoModel) -> Todo:
         assigned_to=db_todo.assignedTo,
         created_at=db_todo.createdAt.isoformat() if db_todo.createdAt else None,
         updated_at=db_todo.updatedAt.isoformat() if db_todo.updatedAt else None,
-        ai_priority=db_todo.aiPriority,
-        ai_reason=db_todo.aiReason
+        ai_priority=None,  # Column doesn't exist in your database
+        ai_reason=None     # Column doesn't exist in your database
     )
 
 security = HTTPBearer()
@@ -78,14 +83,15 @@ app = FastAPI(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:4200"],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Authorization", "Accept", "Origin", "User-Agent"],
+    expose_headers=["*"],
 )
 
 # Mount Socket.IO
-app.mount("/", socketio.ASGIApp(sio, app))
+app.mount("/socket.io/", socketio.ASGIApp(sio, app))
 
 # Dependency to get current user
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):

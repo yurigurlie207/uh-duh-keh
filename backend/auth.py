@@ -9,7 +9,11 @@ from typing import Dict, Optional
 import jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
+from dotenv import load_dotenv
 from database import get_db, User
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
