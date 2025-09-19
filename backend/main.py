@@ -16,7 +16,6 @@ load_dotenv()
 # Add the parent directory to the Python path to import common module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import socketio
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -24,25 +23,16 @@ from pydantic import BaseModel
 import uvicorn
 
 from auth import AuthService
-from ai_handlers import AIHandlers
 from database import get_db, create_tables, Todo as TodoModel, UserPreferences as UserPreferencesModel, User
 from common.events import (
     Todo, UserPreferences, TodoCreateData, TodoUpdateData, 
     TodoToggleData, TodoDeleteData, TodoSetAllData
 )
 
-# Initialize Socket.IO
-sio = socketio.AsyncServer(
-    cors_allowed_origins=["http://localhost:3000"],
-    cors_credentials=True,
-    async_mode='asgi'
-)
-
 # Database will be used instead of in-memory storage
 
 # Initialize services
 auth_service = AuthService()
-ai_handlers = AIHandlers()
 
 # Helper function to convert database model to Pydantic model
 def db_todo_to_pydantic(db_todo: TodoModel) -> Todo:
@@ -90,8 +80,7 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# Mount Socket.IO
-app.mount("/socket.io/", socketio.ASGIApp(sio, app))
+# Socket.IO is now handled by a separate server on port 3002
 
 # Dependency to get current user
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -104,180 +93,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# WebSocket connection handling
-@sio.event
-async def connect(sid, environ, auth=None):
-    """Handle WebSocket connection"""
-    try:
-        if auth and 'token' in auth:
-            username = auth_service.verify_token(auth['token'])
-            print(f"✅ User {username} connected with sid: {sid}")
-            await sio.emit('connect', {'message': f'Welcome {username}!'}, room=sid)
-        else:
-            print(f"❌ Unauthenticated connection attempt from sid: {sid}")
-            await sio.disconnect(sid)
-    except Exception as e:
-        print(f"❌ Connection error: {e}")
-        await sio.disconnect(sid)
-
-@sio.event
-async def disconnect(sid):
-    """Handle WebSocket disconnection"""
-    print(f"👋 Client {sid} disconnected")
-
-# Todo WebSocket events
-@sio.event
-async def todo_create(sid, data):
-    """Create a new todo"""
-    try:
-        todo_data = TodoCreateData(**data)
-        db = next(get_db())
-        try:
-            todo_model = TodoModel(
-                id=str(uuid.uuid4()),
-                title=todo_data.title,
-                assignedTo=todo_data.assigned_to
-            )
-            db.add(todo_model)
-            db.commit()
-            db.refresh(todo_model)
-            
-            # Convert to Pydantic model for response
-            todo = db_todo_to_pydantic(todo_model)
-            
-            await sio.emit('todo:created', todo.dict())
-            print(f"✅ Created todo: {todo.title}")
-        finally:
-            db.close()
-    except Exception as e:
-        await sio.emit('error', {'message': str(e)}, room=sid)
-
-@sio.event
-async def todo_update(sid, data):
-    """Update an existing todo"""
-    try:
-        update_data = TodoUpdateData(**data)
-        db = next(get_db())
-        try:
-            todo_model = db.query(TodoModel).filter(TodoModel.id == update_data.id).first()
-            if not todo_model:
-                await sio.emit('error', {'message': 'Todo not found'}, room=sid)
-                return
-            
-            if update_data.title is not None:
-                todo_model.title = update_data.title
-            if update_data.completed is not None:
-                todo_model.completed = update_data.completed
-            if update_data.priority is not None:
-                todo_model.priority = update_data.priority
-            if update_data.assigned_to is not None:
-                todo_model.assignedTo = update_data.assigned_to
-            
-            todo_model.updatedAt = datetime.utcnow()
-            
-            db.commit()
-            db.refresh(todo_model)
-            
-            # Convert to Pydantic model for response
-            todo = db_todo_to_pydantic(todo_model)
-            
-            await sio.emit('todo:updated', todo.dict())
-            print(f"✅ Updated todo: {todo.title}")
-        finally:
-            db.close()
-    except Exception as e:
-        await sio.emit('error', {'message': str(e)}, room=sid)
-
-@sio.event
-async def todo_toggle(sid, data):
-    """Toggle todo completion status"""
-    try:
-        toggle_data = TodoToggleData(**data)
-        db = next(get_db())
-        try:
-            todo_model = db.query(TodoModel).filter(TodoModel.id == toggle_data.id).first()
-            if not todo_model:
-                await sio.emit('error', {'message': 'Todo not found'}, room=sid)
-                return
-            
-            todo_model.completed = not todo_model.completed
-            todo_model.updatedAt = datetime.utcnow()
-            
-            db.commit()
-            db.refresh(todo_model)
-            
-            # Convert to Pydantic model for response
-            todo = db_todo_to_pydantic(todo_model)
-            
-            await sio.emit('todo:updated', todo.dict())
-            print(f"✅ Toggled todo: {todo.title} -> {todo.completed}")
-        finally:
-            db.close()
-    except Exception as e:
-        await sio.emit('error', {'message': str(e)}, room=sid)
-
-@sio.event
-async def todo_delete(sid, data):
-    """Delete a todo"""
-    try:
-        delete_data = TodoDeleteData(**data)
-        db = next(get_db())
-        try:
-            todo_model = db.query(TodoModel).filter(TodoModel.id == delete_data.id).first()
-            if not todo_model:
-                await sio.emit('error', {'message': 'Todo not found'}, room=sid)
-                return
-            
-            db.delete(todo_model)
-            db.commit()
-            
-            await sio.emit('todo:deleted', {'id': delete_data.id})
-            print(f"✅ Deleted todo: {delete_data.id}")
-        finally:
-            db.close()
-    except Exception as e:
-        await sio.emit('error', {'message': str(e)}, room=sid)
-
-@sio.event
-async def todo_set_all(sid, data):
-    """Set all todos to completed/uncompleted"""
-    try:
-        set_all_data = TodoSetAllData(**data)
-        db = next(get_db())
-        try:
-            todos = db.query(TodoModel).all()
-            for todo_model in todos:
-                todo_model.completed = set_all_data.completed
-                todo_model.updatedAt = datetime.utcnow()
-                
-                # Convert to Pydantic model for response
-                todo = db_todo_to_pydantic(todo_model)
-                await sio.emit('todo:updated', todo.dict())
-            
-            db.commit()
-            print(f"✅ Set all todos to completed: {set_all_data.completed}")
-        finally:
-            db.close()
-    except Exception as e:
-        await sio.emit('error', {'message': str(e)}, room=sid)
-
-@sio.event
-async def todo_remove_completed(sid, data):
-    """Remove all completed todos"""
-    try:
-        db = next(get_db())
-        try:
-            completed_todos = db.query(TodoModel).filter(TodoModel.completed == True).all()
-            for todo_model in completed_todos:
-                db.delete(todo_model)
-                await sio.emit('todo:deleted', {'id': todo_model.id})
-            
-            db.commit()
-            print(f"✅ Removed {len(completed_todos)} completed todos")
-        finally:
-            db.close()
-    except Exception as e:
-        await sio.emit('error', {'message': str(e)}, room=sid)
+# WebSocket handling is now done by the separate socket_server.py on port 3002
 
 # REST API endpoints
 @app.get("/")
@@ -291,6 +107,27 @@ async def get_todos(current_user: str = Depends(get_current_user)):
     try:
         todos = db.query(TodoModel).all()
         return [db_todo_to_pydantic(todo) for todo in todos]
+    finally:
+        db.close()
+
+@app.post("/api/todos", response_model=Todo)
+async def create_todo(todo_data: TodoCreateData, current_user: str = Depends(get_current_user)):
+    """Create a new todo via HTTP API"""
+    db = next(get_db())
+    try:
+        todo_model = TodoModel(
+            id=str(uuid.uuid4()),
+            title=todo_data.title,
+            assignedTo=todo_data.assigned_to,
+            priority=todo_data.priority or "999"
+        )
+        db.add(todo_model)
+        db.commit()
+        db.refresh(todo_model)
+        
+        todo = db_todo_to_pydantic(todo_model)
+        print(f"✅ Created todo via HTTP API: {todo.title}")
+        return todo
     finally:
         db.close()
 
@@ -365,36 +202,7 @@ async def update_user_preferences(
     finally:
         db.close()
 
-@app.post("/api/ai/prioritize")
-async def prioritize_todos(
-    request: Dict[str, Any],
-    current_user: str = Depends(get_current_user)
-):
-    """Prioritize todos using AI"""
-    todos = request.get('todos', [])
-    preferences = request.get('preferences', {})
-    prompt = request.get('prompt', '')
-    
-    try:
-        enhanced_todos = await ai_handlers.prioritize_todos(todos, preferences, prompt)
-        return enhanced_todos
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/ai/insights")
-async def get_ai_insights(
-    request: Dict[str, Any],
-    current_user: str = Depends(get_current_user)
-):
-    """Get AI insights for todos"""
-    todos = request.get('todos', [])
-    preferences = request.get('preferences', {})
-    
-    try:
-        insights = await ai_handlers.get_insights(todos, preferences)
-        return {"insights": insights}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# AI endpoints have been completely disabled
 
 # Authentication endpoints
 @app.post("/api/auth/login")

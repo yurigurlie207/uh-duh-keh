@@ -38,6 +38,7 @@ class ServerEvents:
 class TodoCreateData(BaseModel):
     title: str
     assigned_to: Optional[str] = None
+    priority: Optional[str] = "999"
 
 
 class TodoUpdateData(BaseModel):
