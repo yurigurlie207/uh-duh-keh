@@ -19,13 +19,13 @@ from database import get_db, Todo as TodoModel
 from common.events import TodoCreateData, TodoUpdateData, TodoToggleData, TodoDeleteData, TodoSetAllData
 from auth import AuthService
 
-# Initialize Socket.IO server with WebSocket-focused configuration
+# Initialize Socket.IO server with WebSocket-enabled configuration
 sio = socketio.AsyncServer(
     cors_allowed_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     cors_credentials=True,
     async_mode='asgi',
-    # Disable WebSocket upgrades to use polling-only (more stable)
-    allow_upgrades=False,
+    # Enable WebSocket upgrades
+    allow_upgrades=True,
     ping_timeout=60,
     ping_interval=25,
     # Additional CORS settings for better compatibility
