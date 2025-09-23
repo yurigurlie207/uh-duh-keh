@@ -7,7 +7,6 @@ A modern todo management application with AI-powered prioritization, built with 
 - 🔐 **User Authentication** - Login/Register with JWT tokens
 - 📝 **Todo Management** - Create, update, delete, and toggle todos
 - 👥 **User Assignment** - Assign todos to different family members
-- 🤖 **AI Prioritization** - Claude AI integration for smart task prioritization
 - ⚡ **Real-time Updates** - WebSocket support for live collaboration
 - 🎯 **User Preferences** - Personalized task preferences for better AI suggestions
 - 📱 **Responsive Design** - Modern UI with Tailwind CSS
@@ -119,14 +118,6 @@ websocket-react-python-crud/
 
    The frontend will be available at `http://localhost:3000`
 
-## Usage
-
-### Default Users
-
-The system comes with pre-configured test users:
-- **Username:** `mom` | **Password:** `mom123`
-- **Username:** `dad` | **Password:** `dad123`
-- **Username:** `kid` | **Password:** `kid123`
 
 ### Features Guide
 
@@ -137,14 +128,7 @@ The system comes with pre-configured test users:
 5. **Real-time Updates:** Changes are synchronized across all connected users
 6. **Bulk Actions:** Mark all tasks complete/incomplete or remove completed tasks
 
-### AI Prioritization
 
-The AI system considers:
-- **User Preferences** - Tasks matching your preferred categories get higher priority
-- **Task Dependencies** - Tasks that need to be done before others
-- **Family Impact** - Tasks affecting multiple people
-- **Time Sensitivity** - Urgent or time-sensitive tasks
-- **Energy Levels** - When tasks are typically performed
 
 ## API Endpoints
 
@@ -155,12 +139,7 @@ The AI system considers:
 ### Todos
 - `GET /api/todos` - Get all todos
 - `GET /api/users` - Get available users
-- `GET /api/user-preferences` - Get user preferences
-- `POST /api/user-preferences` - Update user preferences
 
-### AI
-- `POST /api/ai/prioritize` - Prioritize todos with AI
-- `POST /api/ai/insights` - Get AI insights
 
 ### WebSocket Events
 
@@ -221,7 +200,7 @@ PORT=3001
 ### Frontend (.env)
 ```env
 REACT_APP_API_URL=http://localhost:3001/api
-REACT_APP_SOCKET_URL=http://localhost:3001
+REACT_APP_SOCKET_URL=http://localhost:3002
 ```
 
 ## Troubleshooting
