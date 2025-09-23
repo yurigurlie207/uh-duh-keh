@@ -40,6 +40,7 @@ class Todo(Base):
     completed = Column(Boolean, default=False)
     priority = Column(String, default="999")
     assignedTo = Column("assignedTo", String, nullable=True)
+    createdBy = Column("createdBy", String, nullable=False)
     createdAt = Column("createdAt", DateTime, default=datetime.utcnow)
     updatedAt = Column("updatedAt", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     # Note: aiPriority and aiReason columns don't exist in your database

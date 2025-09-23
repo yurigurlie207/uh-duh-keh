@@ -51,6 +51,7 @@ class TodoUpdateData(BaseModel):
 
 class TodoToggleData(BaseModel):
     id: str
+    completed: bool
 
 
 class TodoDeleteData(BaseModel):

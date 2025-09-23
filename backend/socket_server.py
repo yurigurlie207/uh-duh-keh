@@ -24,8 +24,8 @@ sio = socketio.AsyncServer(
     cors_allowed_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     cors_credentials=True,
     async_mode='asgi',
-    # Enable WebSocket upgrades and optimize for WebSocket transport
-    allow_upgrades=True,
+    # Disable WebSocket upgrades to use polling-only (more stable)
+    allow_upgrades=False,
     ping_timeout=60,
     ping_interval=25,
     # Additional CORS settings for better compatibility
@@ -88,8 +88,9 @@ async def connect(sid, environ, auth=None):
             
             # Store user info in session (you can access this in other event handlers)
             await sio.save_session(sid, {'username': username, 'authenticated': True})
-            
-            await sio.emit('connect', {'message': f'Connected as {username}!'}, room=sid)
+
+            # Do not emit a 'connect' event here (reserved by protocol). If needed, emit a custom event.
+            # await sio.emit('server:welcome', {'message': f'Connected as {username}!'}, room=sid)
             return True  # Accept connection
             
         except Exception as auth_error:
@@ -110,7 +111,7 @@ async def disconnect(sid):
     """Handle WebSocket disconnection"""
     print(f"👋 Client {sid} disconnected")
 
-@sio.event
+@sio.on('todo:create')
 async def todo_create(sid, data):
     """Create a new todo"""
     try:
@@ -122,11 +123,21 @@ async def todo_create(sid, data):
         
         db = next(get_db())
         try:
+            # Fetch authenticated user for createdBy
+            username = await get_authenticated_user(sid)
+            if not username:
+                await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+
             todo_model = TodoModel(
                 id=str(uuid.uuid4()),
                 title=todo_data.title,
                 assignedTo=todo_data.assigned_to,
-                priority=todo_data.priority or "999"
+                priority=todo_data.priority or "999",
+                createdBy=username,
+                completed=False,
+                createdAt=datetime.utcnow(),
+                updatedAt=datetime.utcnow()
             )
             db.add(todo_model)
             db.commit()
@@ -144,7 +155,7 @@ async def todo_create(sid, data):
         print(f"❌ Error type: {type(e)}")
         await sio.emit('error', {'message': str(e)}, room=sid)
 
-@sio.event
+@sio.on('todo:update')
 async def todo_update(sid, data):
     """Update an existing todo"""
     try:
@@ -177,7 +188,7 @@ async def todo_update(sid, data):
         print(f"❌ Error in todo_update: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
 
-@sio.event
+@sio.on('todo:toggle')
 async def todo_toggle(sid, data):
     """Toggle todo completion status"""
     try:
@@ -188,7 +199,7 @@ async def todo_toggle(sid, data):
         try:
             todo_model = db.query(TodoModel).filter(TodoModel.id == toggle_data.id).first()
             if todo_model:
-                todo_model.completed = toggle_data.completed
+                todo_model.completed = bool(toggle_data.completed)
                 todo_model.updatedAt = datetime.utcnow()
                 db.commit()
                 db.refresh(todo_model)
@@ -204,7 +215,7 @@ async def todo_toggle(sid, data):
         print(f"❌ Error in todo_toggle: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
 
-@sio.event
+@sio.on('todo:delete')
 async def todo_delete(sid, data):
     """Delete a todo"""
     try:
@@ -227,7 +238,7 @@ async def todo_delete(sid, data):
         print(f"❌ Error in todo_delete: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
 
-@sio.event
+@sio.on('todo:set_all')
 async def todo_set_all(sid, data):
     """Set all todos completion status"""
     try:
@@ -252,7 +263,7 @@ async def todo_set_all(sid, data):
         print(f"❌ Error in todo_set_all: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
 
-@sio.event
+@sio.on('todo:remove_completed')
 async def todo_remove_completed(sid):
     """Remove all completed todos"""
     try:
