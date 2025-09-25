@@ -15,7 +15,7 @@ load_dotenv()
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import socketio
-from database import get_db, Todo as TodoModel
+from database import get_db, Todo as TodoModel, Action as ActionModel
 from common.events import TodoCreateData, TodoUpdateData, TodoToggleData, TodoDeleteData, TodoSetAllData
 from auth import AuthService
 
@@ -59,7 +59,8 @@ def db_todo_to_pydantic(db_todo: TodoModel) -> dict:
         "created_at": db_todo.createdAt.isoformat() if db_todo.createdAt else None,
         "updated_at": db_todo.updatedAt.isoformat() if db_todo.updatedAt else None,
         "ai_priority": None,
-        "ai_reason": None
+        "ai_reason": None,
+        "Completed": getattr(db_todo, 'Completed', None)
     }
 
 @sio.event
@@ -140,6 +141,13 @@ async def todo_create(sid, data):
                 updatedAt=datetime.utcnow()
             )
             db.add(todo_model)
+            # Log transaction
+            db.add(ActionModel(
+                id=str(uuid.uuid4()),
+                userId=username,
+                task=todo_model.title,
+                completed='created'
+            ))
             db.commit()
             db.refresh(todo_model)
             
@@ -174,6 +182,13 @@ async def todo_update(sid, data):
                     todo_model.priority = todo_data.priority
                 
                 todo_model.updatedAt = datetime.utcnow()
+                # Log transaction
+                db.add(ActionModel(
+                    id=str(uuid.uuid4()),
+                    userId=await get_authenticated_user(sid) or 'unknown',
+                    task=todo_model.title,
+                    completed='completed' if todo_model.completed else 'incomplete'
+                ))
                 db.commit()
                 db.refresh(todo_model)
                 
@@ -200,7 +215,15 @@ async def todo_toggle(sid, data):
             todo_model = db.query(TodoModel).filter(TodoModel.id == toggle_data.id).first()
             if todo_model:
                 todo_model.completed = bool(toggle_data.completed)
+                setattr(todo_model, 'Completed', 'completed' if todo_model.completed else None)
                 todo_model.updatedAt = datetime.utcnow()
+                # Log action based on new completion state
+                db.add(ActionModel(
+                    id=str(uuid.uuid4()),
+                    userId=await get_authenticated_user(sid) or 'unknown',
+                    task=todo_model.title,
+                    completed='completed' if todo_model.completed else 'incomplete'
+                ))
                 db.commit()
                 db.refresh(todo_model)
                 
@@ -217,7 +240,7 @@ async def todo_toggle(sid, data):
 
 @sio.on('todo:delete')
 async def todo_delete(sid, data):
-    """Delete a todo"""
+    """Soft delete a todo (mark Completed='deleted')"""
     try:
         print(f"🔍 Received todo_delete data: {data}")
         delete_data = TodoDeleteData(**data)
@@ -226,16 +249,49 @@ async def todo_delete(sid, data):
         try:
             todo_model = db.query(TodoModel).filter(TodoModel.id == delete_data.id).first()
             if todo_model:
-                db.delete(todo_model)
+                setattr(todo_model, 'Completed', 'deleted')
+                todo_model.updatedAt = datetime.utcnow()
                 db.commit()
-                await sio.emit('todo:deleted', {'id': delete_data.id})
-                print(f"✅ Deleted todo: {delete_data.id}")
+                db.refresh(todo_model)
+                todo = db_todo_to_pydantic(todo_model)
+                await sio.emit('todo:updated', todo)
+                print(f"✅ Marked deleted todo: {delete_data.id}")
             else:
                 await sio.emit('error', {'message': 'Todo not found'}, room=sid)
         finally:
             db.close()
     except Exception as e:
         print(f"❌ Error in todo_delete: {e}")
+        await sio.emit('error', {'message': str(e)}, room=sid)
+
+@sio.on('todo:hard_delete')
+async def todo_hard_delete(sid, data):
+    """Permanently delete a todo from the database"""
+    try:
+        print(f"🔍 Received todo_hard_delete data: {data}")
+        delete_data = TodoDeleteData(**data)
+
+        db = next(get_db())
+        try:
+            todo_model = db.query(TodoModel).filter(TodoModel.id == delete_data.id).first()
+            if todo_model:
+                # Log action
+                db.add(ActionModel(
+                    id=str(uuid.uuid4()),
+                    userId=await get_authenticated_user(sid) or 'unknown',
+                    task=todo_model.title,
+                    completed='deleted'
+                ))
+                db.delete(todo_model)
+                db.commit()
+                await sio.emit('todo:deleted', {'id': delete_data.id})
+                print(f"🗑️ Permanently deleted todo: {delete_data.id}")
+            else:
+                await sio.emit('error', {'message': 'Todo not found'}, room=sid)
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"❌ Error in todo_hard_delete: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
 
 @sio.on('todo:set_all')

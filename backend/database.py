@@ -43,6 +43,8 @@ class Todo(Base):
     createdBy = Column("createdBy", String, nullable=False)
     createdAt = Column("createdAt", DateTime, default=datetime.utcnow)
     updatedAt = Column("updatedAt", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # New soft-status column to track 'completed' or 'deleted'
+    Completed = Column("Completed", String, nullable=True)
     # Note: aiPriority and aiReason columns don't exist in your database
     # aiPriority = Column("aiPriority", Integer, nullable=True)
     # aiReason = Column("aiReason", Text, nullable=True)
@@ -61,6 +63,16 @@ class UserPreferences(Base):
     familyCare = Column("familyCare", Boolean, default=False)
     updatedAt = Column("updatedAt", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+# New Transactions table to capture user actions on tasks
+class Action(Base):
+    __tablename__ = "actions"
+
+    id = Column(String, primary_key=True, index=True)
+    userId = Column("userId", String, nullable=False)
+    task = Column(String, nullable=False)
+    dateTime = Column("dateTime", DateTime, default=datetime.utcnow)
+    completed = Column(String, nullable=True)  # e.g., 'created', 'completed', 'deleted', 'incomplete'
+
 # Database dependency
 def get_db():
     db = SessionLocal()
@@ -72,3 +84,21 @@ def get_db():
 # Create all tables
 def create_tables():
     Base.metadata.create_all(bind=engine)
+
+# Attempt to add the Completed column if it doesn't exist (basic runtime migration)
+def _ensure_completed_column():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text('ALTER TABLE todos ADD COLUMN IF NOT EXISTS "Completed" VARCHAR NULL'))
+            conn.commit()
+    except Exception:
+        # Ignore if the column already exists or cannot be altered here
+        pass
+
+_ensure_completed_column()
+
+# Ensure tables (including new actions table) exist
+try:
+    create_tables()
+except Exception:
+    pass
