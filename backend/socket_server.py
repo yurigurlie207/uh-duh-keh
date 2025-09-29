@@ -15,7 +15,7 @@ load_dotenv()
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import socketio
-from database import get_db, Todo as TodoModel, Action as ActionModel
+from database import get_db, Todo as TodoModel, Action as ActionModel, Household
 from common.events import TodoCreateData, TodoUpdateData, TodoToggleData, TodoDeleteData, TodoSetAllData
 from auth import AuthService
 
@@ -41,11 +41,11 @@ async def get_authenticated_user(sid):
     try:
         session = await sio.get_session(sid)
         if session and session.get('authenticated'):
-            return session.get('username')
-        return None
+            return session.get('username'), session.get('household_id')
+        return None, None
     except Exception as e:
         print(f"❌ Error getting session for sid {sid}: {e}")
-        return None
+        return None, None
 
 # Helper function to convert database model to Pydantic model
 def db_todo_to_pydantic(db_todo: TodoModel) -> dict:
@@ -84,11 +84,14 @@ async def connect(sid, environ, auth=None):
         
         try:
             # Verify the JWT token
-            username = auth_service.verify_token(token)
-            print(f"✅ Authenticated user: {username} for sid: {sid}")
+            username, household_id = auth_service.verify_token(token)
+            print(f"✅ Authenticated user: {username} from household: {household_id} for sid: {sid}")
             
             # Store user info in session (you can access this in other event handlers)
-            await sio.save_session(sid, {'username': username, 'authenticated': True})
+            await sio.save_session(sid, {'username': username, 'household_id': household_id, 'authenticated': True})
+
+            # Don't automatically join a room - let user choose
+            print(f"🔐 User {username} authenticated but not in any room yet")
 
             # Do not emit a 'connect' event here (reserved by protocol). If needed, emit a custom event.
             # await sio.emit('server:welcome', {'message': f'Connected as {username}!'}, room=sid)
@@ -110,7 +113,69 @@ async def connect(sid, environ, auth=None):
 @sio.event
 async def disconnect(sid):
     """Handle WebSocket disconnection"""
+    try:
+        session = await sio.get_session(sid)
+        if session and session.get('current_room'):
+            current_room = session.get('current_room')
+            await sio.leave_room(sid, current_room)
+            print(f"👋 User left room: {current_room}")
+    except Exception as e:
+        print(f"⚠️ Error during disconnect cleanup: {e}")
     print(f"👋 Client {sid} disconnected")
+
+@sio.on('join_household')
+async def join_household(sid, data):
+    """Allow users to explicitly join a household room"""
+    try:
+        print(f"🔍 Received join_household request from sid: {sid}")
+        print(f"🔍 Data: {data}")
+        
+        # Get user session
+        session = await sio.get_session(sid)
+        if not session or not session.get('authenticated'):
+            await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+            return
+        
+        username = session.get('username')
+        user_household_id = session.get('household_id')
+        requested_household_id = data.get('household_id')
+        requested_household_name = data.get('household_name')
+
+        # If household_name provided, resolve to id
+        if not requested_household_id and requested_household_name:
+            db = next(get_db())
+            try:
+                h = db.query(Household).filter(Household.name == requested_household_name).first()
+                if h:
+                    requested_household_id = h.id
+            finally:
+                db.close()
+        
+        # Validate that user can only join their own household
+        if requested_household_id != user_household_id:
+            await sio.emit('error', {'message': 'You can only join your own household room'}, room=sid)
+            return
+        
+        # Leave current room if any
+        current_room = session.get('current_room')
+        if current_room:
+            await sio.leave_room(sid, current_room)
+            print(f"👋 User {username} left room: {current_room}")
+        
+        # Join the requested household room
+        room_name = f"household_{requested_household_id}"
+        await sio.enter_room(sid, room_name)
+        
+        # Update session with current room
+        session['current_room'] = room_name
+        await sio.save_session(sid, session)
+        
+        print(f"🏠 User {username} joined household room: {room_name}")
+        await sio.emit('room_joined', {'room': room_name, 'household_id': requested_household_id}, room=sid)
+        
+    except Exception as e:
+        print(f"❌ Error in join_household: {e}")
+        await sio.emit('error', {'message': str(e)}, room=sid)
 
 @sio.on('todo:create')
 async def todo_create(sid, data):
@@ -125,9 +190,15 @@ async def todo_create(sid, data):
         db = next(get_db())
         try:
             # Fetch authenticated user for createdBy
-            username = await get_authenticated_user(sid)
-            if not username:
+            username, household_id = await get_authenticated_user(sid)
+            if not username or not household_id:
                 await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+            
+            # Check if user is in a room
+            session = await sio.get_session(sid)
+            if not session.get('current_room'):
+                await sio.emit('error', {'message': 'You must join a household room first'}, room=sid)
                 return
 
             todo_model = TodoModel(
@@ -136,6 +207,7 @@ async def todo_create(sid, data):
                 assignedTo=todo_data.assigned_to,
                 priority=todo_data.priority or "999",
                 createdBy=username,
+                householdId=household_id,
                 completed=False,
                 createdAt=datetime.utcnow(),
                 updatedAt=datetime.utcnow()
@@ -145,6 +217,7 @@ async def todo_create(sid, data):
             db.add(ActionModel(
                 id=str(uuid.uuid4()),
                 userId=username,
+                householdId=household_id,
                 task=todo_model.title,
                 completed='created'
             ))
@@ -154,8 +227,9 @@ async def todo_create(sid, data):
             # Convert to Pydantic model for response
             todo = db_todo_to_pydantic(todo_model)
             
-            await sio.emit('todo:created', todo)
-            print(f"✅ Created todo: {todo['title']}")
+            # Broadcast to household room only
+            await sio.emit('todo:created', todo, room=f"household_{household_id}")
+            print(f"✅ Created todo: {todo['title']} (broadcast to household_{household_id})")
         finally:
             db.close()
     except Exception as e:
@@ -172,6 +246,18 @@ async def todo_update(sid, data):
         
         db = next(get_db())
         try:
+            username, household_id = await get_authenticated_user(sid)
+            if not username or not household_id:
+                await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+            
+            # Check if user is in a room
+            session = await sio.get_session(sid)
+            if not session.get('current_room'):
+                await sio.emit('error', {'message': 'You must join a household room first'}, room=sid)
+                return
+                
+            # Find todo (no household filtering needed - rooms handle isolation)
             todo_model = db.query(TodoModel).filter(TodoModel.id == todo_data.id).first()
             if todo_model:
                 if todo_data.title is not None:
@@ -185,7 +271,8 @@ async def todo_update(sid, data):
                 # Log transaction
                 db.add(ActionModel(
                     id=str(uuid.uuid4()),
-                    userId=await get_authenticated_user(sid) or 'unknown',
+                    userId=username,
+                    householdId=household_id,
                     task=todo_model.title,
                     completed='completed' if todo_model.completed else 'incomplete'
                 ))
@@ -193,8 +280,9 @@ async def todo_update(sid, data):
                 db.refresh(todo_model)
                 
                 todo = db_todo_to_pydantic(todo_model)
-                await sio.emit('todo:updated', todo)
-                print(f"✅ Updated todo: {todo['title']}")
+                # Broadcast to household room only
+                await sio.emit('todo:updated', todo, room=f"household_{household_id}")
+                print(f"✅ Updated todo: {todo['title']} (broadcast to household_{household_id})")
             else:
                 await sio.emit('error', {'message': 'Todo not found'}, room=sid)
         finally:
@@ -212,6 +300,18 @@ async def todo_toggle(sid, data):
         
         db = next(get_db())
         try:
+            username, household_id = await get_authenticated_user(sid)
+            if not username or not household_id:
+                await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+            
+            # Check if user is in a room
+            session = await sio.get_session(sid)
+            if not session.get('current_room'):
+                await sio.emit('error', {'message': 'You must join a household room first'}, room=sid)
+                return
+                
+            # Find todo (no household filtering needed - rooms handle isolation)
             todo_model = db.query(TodoModel).filter(TodoModel.id == toggle_data.id).first()
             if todo_model:
                 todo_model.completed = bool(toggle_data.completed)
@@ -220,7 +320,8 @@ async def todo_toggle(sid, data):
                 # Log action based on new completion state
                 db.add(ActionModel(
                     id=str(uuid.uuid4()),
-                    userId=await get_authenticated_user(sid) or 'unknown',
+                    userId=username,
+                    householdId=household_id,
                     task=todo_model.title,
                     completed='completed' if todo_model.completed else 'incomplete'
                 ))
@@ -228,8 +329,9 @@ async def todo_toggle(sid, data):
                 db.refresh(todo_model)
                 
                 todo = db_todo_to_pydantic(todo_model)
-                await sio.emit('todo:toggled', todo)
-                print(f"✅ Toggled todo: {todo['title']} -> {todo['completed']}")
+                # Broadcast to household room only
+                await sio.emit('todo:toggled', todo, room=f"household_{household_id}")
+                print(f"✅ Toggled todo: {todo['title']} -> {todo['completed']} (broadcast to household_{household_id})")
             else:
                 await sio.emit('error', {'message': 'Todo not found'}, room=sid)
         finally:
@@ -247,6 +349,18 @@ async def todo_delete(sid, data):
         
         db = next(get_db())
         try:
+            username, household_id = await get_authenticated_user(sid)
+            if not username or not household_id:
+                await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+            
+            # Check if user is in a room
+            session = await sio.get_session(sid)
+            if not session.get('current_room'):
+                await sio.emit('error', {'message': 'You must join a household room first'}, room=sid)
+                return
+                
+            # Find todo (no household filtering needed - rooms handle isolation)
             todo_model = db.query(TodoModel).filter(TodoModel.id == delete_data.id).first()
             if todo_model:
                 setattr(todo_model, 'Completed', 'deleted')
@@ -254,8 +368,9 @@ async def todo_delete(sid, data):
                 db.commit()
                 db.refresh(todo_model)
                 todo = db_todo_to_pydantic(todo_model)
-                await sio.emit('todo:updated', todo)
-                print(f"✅ Marked deleted todo: {delete_data.id}")
+                # Broadcast to household room only
+                await sio.emit('todo:updated', todo, room=f"household_{household_id}")
+                print(f"✅ Marked deleted todo: {delete_data.id} (broadcast to household_{household_id})")
             else:
                 await sio.emit('error', {'message': 'Todo not found'}, room=sid)
         finally:
@@ -273,19 +388,33 @@ async def todo_hard_delete(sid, data):
 
         db = next(get_db())
         try:
+            username, household_id = await get_authenticated_user(sid)
+            if not username or not household_id:
+                await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+            
+            # Check if user is in a room
+            session = await sio.get_session(sid)
+            if not session.get('current_room'):
+                await sio.emit('error', {'message': 'You must join a household room first'}, room=sid)
+                return
+                
+            # Find todo (no household filtering needed - rooms handle isolation)
             todo_model = db.query(TodoModel).filter(TodoModel.id == delete_data.id).first()
             if todo_model:
                 # Log action
                 db.add(ActionModel(
                     id=str(uuid.uuid4()),
-                    userId=await get_authenticated_user(sid) or 'unknown',
+                    userId=username,
+                    householdId=household_id,
                     task=todo_model.title,
                     completed='deleted'
                 ))
                 db.delete(todo_model)
                 db.commit()
-                await sio.emit('todo:deleted', {'id': delete_data.id})
-                print(f"🗑️ Permanently deleted todo: {delete_data.id}")
+                # Broadcast to household room only
+                await sio.emit('todo:deleted', {'id': delete_data.id}, room=f"household_{household_id}")
+                print(f"🗑️ Permanently deleted todo: {delete_data.id} (broadcast to household_{household_id})")
             else:
                 await sio.emit('error', {'message': 'Todo not found'}, room=sid)
         finally:
@@ -303,16 +432,28 @@ async def todo_set_all(sid, data):
         
         db = next(get_db())
         try:
-            todos = db.query(TodoModel).all()
+            username, household_id = await get_authenticated_user(sid)
+            if not username or not household_id:
+                await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+            
+            # Check if user is in a room
+            session = await sio.get_session(sid)
+            if not session.get('current_room'):
+                await sio.emit('error', {'message': 'You must join a household room first'}, room=sid)
+                return
+                
+            # Get all todos for the household (rooms handle isolation, but we still need householdId for data integrity)
+            todos = db.query(TodoModel).filter(TodoModel.householdId == household_id).all()
             for todo in todos:
                 todo.completed = set_all_data.completed
                 todo.updatedAt = datetime.utcnow()
             db.commit()
             
-            # Emit updated todos
+            # Emit updated todos to household room only
             updated_todos = [db_todo_to_pydantic(todo) for todo in todos]
-            await sio.emit('todos:updated', updated_todos)
-            print(f"✅ Set all todos to: {set_all_data.completed}")
+            await sio.emit('todos:updated', updated_todos, room=f"household_{household_id}")
+            print(f"✅ Set all todos to: {set_all_data.completed} (broadcast to household_{household_id})")
         finally:
             db.close()
     except Exception as e:
@@ -327,13 +468,29 @@ async def todo_remove_completed(sid):
         
         db = next(get_db())
         try:
-            completed_todos = db.query(TodoModel).filter(TodoModel.completed == True).all()
+            username, household_id = await get_authenticated_user(sid)
+            if not username or not household_id:
+                await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+            
+            # Check if user is in a room
+            session = await sio.get_session(sid)
+            if not session.get('current_room'):
+                await sio.emit('error', {'message': 'You must join a household room first'}, room=sid)
+                return
+                
+            # Get completed todos for the household (rooms handle isolation, but we still need householdId for data integrity)
+            completed_todos = db.query(TodoModel).filter(
+                TodoModel.completed == True,
+                TodoModel.householdId == household_id
+            ).all()
             for todo in completed_todos:
                 db.delete(todo)
             db.commit()
             
-            await sio.emit('todos:completed_removed', {'count': len(completed_todos)})
-            print(f"✅ Removed {len(completed_todos)} completed todos")
+            # Broadcast to household room only
+            await sio.emit('todos:completed_removed', {'count': len(completed_todos)}, room=f"household_{household_id}")
+            print(f"✅ Removed {len(completed_todos)} completed todos (broadcast to household_{household_id})")
         finally:
             db.close()
     except Exception as e:

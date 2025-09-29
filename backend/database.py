@@ -29,6 +29,8 @@ class User(Base):
     
     username = Column(String, primary_key=True, index=True)
     passwordHash = Column("passwordHash", String, nullable=False)
+    householdId = Column("householdId", String, nullable=False)
+    isAdmin = Column("isAdmin", Boolean, default=False)
     createdAt = Column("createdAt", DateTime, default=datetime.utcnow)
     updatedAt = Column("updatedAt", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -41,6 +43,7 @@ class Todo(Base):
     priority = Column(String, default="999")
     assignedTo = Column("assignedTo", String, nullable=True)
     createdBy = Column("createdBy", String, nullable=False)
+    householdId = Column("householdId", String, nullable=False)
     createdAt = Column("createdAt", DateTime, default=datetime.utcnow)
     updatedAt = Column("updatedAt", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     # New soft-status column to track 'completed' or 'deleted'
@@ -69,9 +72,30 @@ class Action(Base):
 
     id = Column(String, primary_key=True, index=True)
     userId = Column("userId", String, nullable=False)
+    householdId = Column("householdId", String, nullable=False)
     task = Column(String, nullable=False)
     dateTime = Column("dateTime", DateTime, default=datetime.utcnow)
     completed = Column(String, nullable=True)  # e.g., 'created', 'completed', 'deleted', 'incomplete'
+
+# Household table to map human-friendly names to household IDs
+class Household(Base):
+    __tablename__ = "households"
+
+    id = Column(String, primary_key=True, index=True)  # householdId used by users/todos
+    name = Column(String, unique=True, nullable=False)  # human-friendly unique name
+    createdAt = Column("createdAt", DateTime, default=datetime.utcnow)
+    updatedAt = Column("updatedAt", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+# Join requests for admin approval
+class JoinRequest(Base):
+    __tablename__ = "join_requests"
+
+    id = Column(String, primary_key=True, index=True)
+    username = Column(String, nullable=False)
+    householdId = Column(String, nullable=False)
+    status = Column(String, default="pending")  # 'pending' | 'approved' | 'rejected'
+    createdAt = Column("createdAt", DateTime, default=datetime.utcnow)
+    updatedAt = Column("updatedAt", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 # Database dependency
 def get_db():
@@ -96,6 +120,18 @@ def _ensure_completed_column():
         pass
 
 _ensure_completed_column()
+
+# Attempt to add the isAdmin column if it doesn't exist (basic runtime migration)
+def _ensure_is_admin_column():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS "isAdmin" BOOLEAN DEFAULT FALSE'))
+            conn.commit()
+    except Exception:
+        # Ignore if the column already exists or cannot be altered here
+        pass
+
+_ensure_is_admin_column()
 
 # Ensure tables (including new actions table) exist
 try:

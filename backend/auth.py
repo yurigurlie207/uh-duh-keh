@@ -37,29 +37,31 @@ class AuthService:
         """Verify a password against its hash"""
         return pwd_context.verify(plain_password, hashed_password)
     
-    def create_access_token(self, username: str) -> str:
+    def create_access_token(self, username: str, household_id: str) -> str:
         """Create a JWT access token"""
         expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         to_encode = {
             "sub": username,
+            "household_id": household_id,
             "exp": expire,
             "iat": datetime.utcnow()
         }
         encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
         return encoded_jwt
     
-    def verify_token(self, token: str) -> str:
-        """Verify and decode a JWT token"""
+    def verify_token(self, token: str) -> tuple[str, str]:
+        """Verify and decode a JWT token, returns (username, household_id)"""
         try:
             payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
             username: str = payload.get("sub")
-            if username is None:
+            household_id: str = payload.get("household_id")
+            if username is None or household_id is None:
                 raise Exception("Invalid token")
-            return username
+            return username, household_id
         except jwt.PyJWTError:
             raise Exception("Invalid token")
     
-    def register(self, username: str, password: str, db: Session = None) -> bool:
+    def register(self, username: str, password: str, household_id: str, is_admin: bool = False, db: Session = None) -> bool:
         """Register a new user"""
         if db is None:
             db = next(get_db())
@@ -75,7 +77,9 @@ class AuthService:
             hashed_password = self.hash_password(password)
             new_user = User(
                 username=username,
-                passwordHash=hashed_password
+                passwordHash=hashed_password,
+                householdId=household_id,
+                isAdmin=is_admin
             )
             db.add(new_user)
             db.commit()
@@ -92,10 +96,33 @@ class AuthService:
             if not user:
                 raise Exception("Invalid username or password")
             
-            if not self.verify_password(password, user.passwordHash):
+            # Verify password, with legacy plaintext migration support
+            verified = False
+            try:
+                verified = self.verify_password(password, user.passwordHash)
+            except Exception:
+                verified = False
+            if not verified:
+                # Legacy: if stored password isn't a bcrypt hash, allow one-time migration
+                stored = user.passwordHash or ""
+                is_bcrypt = stored.startswith("$2a$") or stored.startswith("$2b$") or stored.startswith("$2y$")
+                if (not is_bcrypt) and (stored == password):
+                    # Migrate to bcrypt
+                    try:
+                        user.passwordHash = self.hash_password(password)
+                        db.commit()
+                        verified = True
+                    except Exception:
+                        verified = False
+            if not verified:
                 raise Exception("Invalid username or password")
             
-            return self.create_access_token(username)
+            # Safety: ensure user has a household_id
+            if not getattr(user, 'householdId', None):
+                import uuid as _uuid
+                user.householdId = f"household_{_uuid.uuid4().hex[:8]}"
+                db.commit()
+            return self.create_access_token(username, user.householdId)
         finally:
             db.close()
     
@@ -107,6 +134,7 @@ class AuthService:
             if user:
                 return {
                     "username": user.username,
+                    "household_id": user.householdId,
                     "created_at": user.createdAt.isoformat() if user.createdAt else None
                 }
             return None
