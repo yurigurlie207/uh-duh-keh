@@ -35,6 +35,11 @@ sio = socketio.AsyncServer(
 # Initialize auth service
 auth_service = AuthService()
 
+# Helper function to create room name (handles household_id with or without prefix)
+def get_room_name(household_id: str) -> str:
+    """Get room name from household_id, handling existing prefix"""
+    return household_id if household_id.startswith('household_') else f"household_{household_id}"
+
 # Helper function to get authenticated user from session
 async def get_authenticated_user(sid):
     """Get the authenticated user from the session"""
@@ -161,10 +166,13 @@ async def connect(sid, environ, auth=None):
         try:
             # Verify the JWT token
             username, household_id = auth_service.verify_token(token)
-            print(f"✅ Authenticated user: {username} from household: {household_id} for sid: {sid}")
+            print(f"=" * 80)
+            print(f"✅✅✅ AUTHENTICATED USER: {username} from household: {household_id} for sid: {sid}")
+            print(f"=" * 80)
             
             # Store user info in session (you can access this in other event handlers)
             await sio.save_session(sid, {'username': username, 'household_id': household_id, 'authenticated': True})
+            print(f"💾 Session saved for {username}: {{'username': '{username}', 'household_id': '{household_id}', 'authenticated': True}}")
 
             # Don't automatically join a room - let user choose
             print(f"🔐 User {username} authenticated but not in any room yet")
@@ -193,8 +201,13 @@ async def disconnect(sid):
         session = await sio.get_session(sid)
         if session and session.get('current_room'):
             current_room = session.get('current_room')
+            username = session.get('username')
             await sio.leave_room(sid, current_room)
-            print(f"👋 User left room: {current_room}")
+            print(f"👋 User {username} left room: {current_room}")
+            
+            # Broadcast to everyone in the room that a user went offline
+            if username:
+                await sio.emit('user:offline', {'username': username}, room=current_room)
     except Exception as e:
         print(f"⚠️ Error during disconnect cleanup: {e}")
     print(f"👋 Client {sid} disconnected")
@@ -239,7 +252,7 @@ async def join_household(sid, data):
             print(f"👋 User {username} left room: {current_room}")
         
         # Join the requested household room
-        room_name = f"household_{requested_household_id}"
+        room_name = get_room_name(requested_household_id)
         await sio.enter_room(sid, room_name)
         
         # Update session with current room
@@ -248,6 +261,9 @@ async def join_household(sid, data):
         
         print(f"🏠 User {username} joined household room: {room_name}")
         await sio.emit('room_joined', {'room': room_name, 'household_id': requested_household_id}, room=sid)
+        
+        # Broadcast to everyone in the room that a user came online
+        await sio.emit('user:online', {'username': username}, room=room_name)
         
         # Debug: Check room membership after joining
         room_clients = list(sio.manager.get_participants(namespace='/', room=room_name))
@@ -311,7 +327,7 @@ async def todo_create(sid, data):
             todo = db_todo_to_pydantic(todo_model)
             
             # Broadcast to household room only
-            room_name = f"household_{household_id}"
+            room_name = get_room_name(household_id)
             await sio.emit('todo:created', todo, room=room_name)
             print(f"✅ Created todo: {todo['title']} (broadcast to {room_name})")
             
@@ -371,7 +387,7 @@ async def todo_update(sid, data):
                 
                 todo = db_todo_to_pydantic(todo_model)
                 # Broadcast to household room only
-                await sio.emit('todo:updated', todo, room=f"household_{household_id}")
+                await sio.emit('todo:updated', todo, room=get_room_name(household_id))
                 print(f"✅ Updated todo: {todo['title']} (broadcast to household_{household_id})")
                 
                 # Note: Individual todo events handle the updates, no need for full state sync
@@ -420,7 +436,7 @@ async def todo_toggle(sid, data):
                 
                 todo = db_todo_to_pydantic(todo_model)
                 # Broadcast to household room only
-                await sio.emit('todo:toggled', todo, room=f"household_{household_id}")
+                await sio.emit('todo:toggled', todo, room=get_room_name(household_id))
                 print(f"✅ Toggled todo: {todo['title']} -> {todo['completed']} (broadcast to household_{household_id})")
                 
                 # Note: Individual todo events handle the updates, no need for full state sync
@@ -466,7 +482,7 @@ async def todo_delete(sid, data):
                 db.commit()
                 
                 # Broadcast to household room only
-                await sio.emit('todo:deleted', {'id': delete_data.id}, room=f"household_{household_id}")
+                await sio.emit('todo:deleted', {'id': delete_data.id}, room=get_room_name(household_id))
                 print(f"✅ Soft deleted todo: {delete_data.id} (logged in Action table, broadcast to household_{household_id})")
                 
                 # Note: Individual todo events handle the updates, no need for full state sync
@@ -512,7 +528,7 @@ async def todo_hard_delete(sid, data):
                 db.delete(todo_model)
                 db.commit()
                 # Broadcast to household room only
-                await sio.emit('todo:deleted', {'id': delete_data.id}, room=f"household_{household_id}")
+                await sio.emit('todo:deleted', {'id': delete_data.id}, room=get_room_name(household_id))
                 print(f"🗑️ Permanently deleted todo: {delete_data.id} (broadcast to household_{household_id})")
                 
                 # Note: Individual todo events handle the updates, no need for full state sync
@@ -560,7 +576,7 @@ async def todo_set_all(sid, data):
             
             # Emit updated todos to household room only
             updated_todos = [db_todo_to_pydantic(todo) for todo in todos]
-            await sio.emit('todos:updated', updated_todos, room=f"household_{household_id}")
+            await sio.emit('todos:updated', updated_todos, room=get_room_name(household_id))
             print(f"✅ Set all todos to: {set_all_data.completed} (broadcast to household_{household_id})")
             
             # Note: Individual todo events handle the updates, no need for full state sync
@@ -609,7 +625,7 @@ async def todo_remove_completed(sid):
             db.commit()
             
             # Broadcast to household room only
-            await sio.emit('todos:completed_removed', {'count': len(completed_todos)}, room=f"household_{household_id}")
+            await sio.emit('todos:completed_removed', {'count': len(completed_todos)}, room=get_room_name(household_id))
             print(f"✅ Removed {len(completed_todos)} completed todos (broadcast to household_{household_id})")
             
             # Note: Individual todo events handle the updates, no need for full state sync
@@ -666,7 +682,7 @@ async def restart_day(sid, data=None):
                 print(f"  {i+1}. {todo.get('title', 'No title')} (completed: {todo.get('completed', 'N/A')})")
             
             # Debug: Check room membership
-            room_name = f"household_{household_id}"
+            room_name = get_room_name(household_id)
             room_clients = list(sio.manager.get_participants(namespace='/', room=room_name))
             print(f"🔍 Room {room_name} has {len(room_clients)} clients: {room_clients}")
             
@@ -683,10 +699,49 @@ async def restart_day(sid, data=None):
 if __name__ == "__main__":
     import uvicorn
     from fastapi import FastAPI
+    from starlette.responses import JSONResponse
+    from starlette.routing import Mount
     
     # Create a minimal FastAPI app for Socket.IO
     app = FastAPI()
-    app.mount("/", socketio.ASGIApp(sio, app))
+    
+    # Add endpoint to get online users for a household (BEFORE mounting Socket.IO)
+    @app.get("/online-users/{household_id}")
+    async def get_online_users(household_id: str):
+        """Get list of online users in a household"""
+        try:
+            room_name = get_room_name(household_id)
+            print(f"🔍 Checking online users for room: {room_name}")
+            
+            # Get all session IDs in this room
+            # get_participants returns tuples of (sid, eio_sid), we only need the first element
+            room_participants = list(sio.manager.get_participants(namespace='/', room=room_name))
+            room_sids = [p[0] if isinstance(p, tuple) else p for p in room_participants]
+            print(f"🔍 Found {len(room_sids)} connections in room")
+            print(f"🔍 Session IDs: {room_sids}")
+            
+            # Get usernames for each session
+            online_users = []
+            for sid in room_sids:
+                try:
+                    session = await sio.get_session(sid)
+                    if session and session.get('username'):
+                        username = session['username']
+                        online_users.append(username)
+                        print(f"🔍 Found online user: {username}")
+                except Exception as e:
+                    print(f"⚠️ Error getting session for {sid}: {e}")
+            
+            print(f"✅ Returning {len(online_users)} online users: {online_users}")
+            return JSONResponse({"users": online_users, "count": len(online_users)})
+        except Exception as e:
+            print(f"❌ Error getting online users: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"users": [], "count": 0})
+    
+    # Create the Socket.IO ASGI app
+    socketio_app = socketio.ASGIApp(sio, other_asgi_app=app)
     
     print("🚀 Starting Socket.IO server on port 3002...")
-    uvicorn.run(app, host="0.0.0.0", port=3002)
+    uvicorn.run(socketio_app, host="0.0.0.0", port=3002)

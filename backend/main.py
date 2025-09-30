@@ -183,15 +183,56 @@ async def create_todo(todo_data: TodoCreateData, current_user: tuple = Depends(g
 
 @app.get("/api/users")
 async def get_users(current_user: tuple = Depends(get_current_user)):
-    """Get available users from the user's household"""
+    """Get available users from the user's household with online status"""
     username, household_id = current_user
+    print(f"🔍 GET /api/users called by {username} for household {household_id}")
     db = next(get_db())
     try:
         # Filter by household_id for REST API (rooms handle Socket.IO isolation)
         users = db.query(User).filter(User.householdId == household_id).all()
-        return [{"username": user.username} for user in users]
+        print(f"🔍 Found {len(users)} users in household")
+        
+        # Check online status by querying the socket server
+        # We'll use a simple file-based approach or in-memory store
+        # For now, we'll return a placeholder and implement socket tracking
+        print(f"🔍 About to call get_online_users_in_household...")
+        online_users = await get_online_users_in_household(household_id)
+        print(f"🔍 Got online users: {online_users}")
+        
+        return [
+            {
+                "username": user.username, 
+                "is_admin": user.isAdmin or False,
+                "is_online": user.username in online_users
+            } 
+            for user in users
+        ]
     finally:
         db.close()
+
+async def get_online_users_in_household(household_id: str) -> set:
+    """Get list of online users in a household by checking socket connections"""
+    try:
+        import httpx
+        # Query the socket server's status endpoint
+        print(f"🔍 Querying online users for household: {household_id}")
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"http://localhost:3002/online-users/{household_id}",
+                timeout=2.0
+            )
+            print(f"🔍 Response status: {response.status_code}")
+            print(f"🔍 Response body: {response.text}")
+            if response.status_code == 200:
+                data = response.json()
+                users = set(data.get('users', []))
+                print(f"✅ Online users: {users}")
+                return users
+    except Exception as e:
+        print(f"❌ Failed to get online users: {e}")
+        import traceback
+        traceback.print_exc()
+    return set()
 
 @app.get("/api/user-preferences", response_model=UserPreferences)
 async def get_user_preferences(current_user: tuple = Depends(get_current_user)):
