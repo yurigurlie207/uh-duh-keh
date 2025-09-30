@@ -145,3 +145,4 @@ socket.on('error', (error) => {
 4. **User disconnects** → Automatically leaves room
 
 This approach gives users explicit control over their room membership while maintaining security and providing clear feedback about their connection status.
+

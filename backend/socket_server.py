@@ -48,20 +48,96 @@ async def get_authenticated_user(sid):
         return None, None
 
 # Helper function to convert database model to Pydantic model
-def db_todo_to_pydantic(db_todo: TodoModel) -> dict:
+def db_todo_to_pydantic(db_todo: TodoModel, action_status=None) -> dict:
     """Convert database Todo model to Pydantic Todo model"""
+    # Initialize default values
+    is_deleted = False
+    is_completed = False
+    
+    # If action_status is provided, use it; otherwise query the database
+    if action_status is not None:
+        is_deleted = action_status == 'deleted'
+        is_completed = action_status == 'completed'
+    else:
+        # Check if todo is soft-deleted by looking at Action table
+        from database import Action
+        db = next(get_db())
+        try:
+            # Get the latest action for this todo to determine if it's deleted
+            latest_action = db.query(Action).filter(
+                Action.task == db_todo.title,
+                Action.householdId == db_todo.householdId
+            ).order_by(Action.dateTime.desc()).first()
+            
+            is_deleted = latest_action and latest_action.completed == 'deleted'
+            is_completed = latest_action and latest_action.completed == 'completed'
+        finally:
+            db.close()
+    
     return {
         "id": db_todo.id,
         "title": db_todo.title,
-        "completed": db_todo.completed,
+        "completed": is_completed,
         "priority": db_todo.priority,
         "assigned_to": db_todo.assignedTo,
         "created_at": db_todo.createdAt.isoformat() if db_todo.createdAt else None,
         "updated_at": db_todo.updatedAt.isoformat() if db_todo.updatedAt else None,
         "ai_priority": None,
         "ai_reason": None,
-        "Completed": getattr(db_todo, 'Completed', None)
+        "Completed": 'deleted' if is_deleted else ('completed' if is_completed else None),
+        "is_deleted": is_deleted  # Add explicit deleted flag for frontend
     }
+
+async def send_current_state(sid, household_id):
+    """Send current state (todos, users) to a newly joined user"""
+    try:
+        db = next(get_db())
+        try:
+            # Get all todos for this household
+            todos = db.query(TodoModel).filter(
+                TodoModel.householdId == household_id
+            ).all()
+            
+            # Get all actions for the household to determine status
+            from database import Action
+            all_actions = db.query(Action).filter(
+                Action.householdId == household_id
+            ).order_by(Action.dateTime.desc()).all()
+            
+            # Create a map of task -> latest action status
+            task_status_map = {}
+            for action in all_actions:
+                if action.task not in task_status_map:
+                    task_status_map[action.task] = action.completed
+            
+            # Filter out soft-deleted todos and convert to Pydantic models
+            todos_data = []
+            for todo in todos:
+                task_status = task_status_map.get(todo.title)
+                if task_status != 'deleted':  # Only include non-deleted todos
+                    todos_data.append(db_todo_to_pydantic(todo, task_status))
+            
+            # Get all users for this household
+            from database import User
+            users = db.query(User).filter(User.householdId == household_id).all()
+            users_data = [{"username": user.username} for user in users]
+            
+            # Send state to the specific user
+            await sio.emit('state_sync', {
+                'todos': todos_data,
+                'users': users_data,
+                'household_id': household_id
+            }, room=sid)
+            
+            print(f"📤 Sent current state to user: {len(todos_data)} todos, {len(users_data)} users")
+            
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"❌ Error sending current state: {e}")
+        await sio.emit('error', {'message': f'Failed to load current state: {str(e)}'}, room=sid)
+
+# Note: Removed broadcast_state_update function - using individual todo events instead
 
 @sio.event
 async def connect(sid, environ, auth=None):
@@ -173,6 +249,14 @@ async def join_household(sid, data):
         print(f"🏠 User {username} joined household room: {room_name}")
         await sio.emit('room_joined', {'room': room_name, 'household_id': requested_household_id}, room=sid)
         
+        # Debug: Check room membership after joining
+        room_clients = list(sio.manager.get_participants(namespace='/', room=room_name))
+        print(f"🔍 After joining, room {room_name} has {len(room_clients)} clients: {room_clients}")
+        
+        # Send current state to the newly joined user
+        print(f"📤 Sending current state to newly joined user {username}")
+        await send_current_state(sid, requested_household_id)
+        
     except Exception as e:
         print(f"❌ Error in join_household: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
@@ -208,7 +292,6 @@ async def todo_create(sid, data):
                 priority=todo_data.priority or "999",
                 createdBy=username,
                 householdId=household_id,
-                completed=False,
                 createdAt=datetime.utcnow(),
                 updatedAt=datetime.utcnow()
             )
@@ -228,8 +311,15 @@ async def todo_create(sid, data):
             todo = db_todo_to_pydantic(todo_model)
             
             # Broadcast to household room only
-            await sio.emit('todo:created', todo, room=f"household_{household_id}")
-            print(f"✅ Created todo: {todo['title']} (broadcast to household_{household_id})")
+            room_name = f"household_{household_id}"
+            await sio.emit('todo:created', todo, room=room_name)
+            print(f"✅ Created todo: {todo['title']} (broadcast to {room_name})")
+            
+            # Debug: Check who's in the room
+            room_clients = list(sio.manager.get_participants(namespace='/', room=room_name))
+            print(f"🔍 Room {room_name} has {len(room_clients)} clients: {room_clients}")
+            
+            # Note: Individual todo events handle the updates, no need for full state sync
         finally:
             db.close()
     except Exception as e:
@@ -283,6 +373,8 @@ async def todo_update(sid, data):
                 # Broadcast to household room only
                 await sio.emit('todo:updated', todo, room=f"household_{household_id}")
                 print(f"✅ Updated todo: {todo['title']} (broadcast to household_{household_id})")
+                
+                # Note: Individual todo events handle the updates, no need for full state sync
             else:
                 await sio.emit('error', {'message': 'Todo not found'}, room=sid)
         finally:
@@ -314,8 +406,6 @@ async def todo_toggle(sid, data):
             # Find todo (no household filtering needed - rooms handle isolation)
             todo_model = db.query(TodoModel).filter(TodoModel.id == toggle_data.id).first()
             if todo_model:
-                todo_model.completed = bool(toggle_data.completed)
-                setattr(todo_model, 'Completed', 'completed' if todo_model.completed else None)
                 todo_model.updatedAt = datetime.utcnow()
                 # Log action based on new completion state
                 db.add(ActionModel(
@@ -323,7 +413,7 @@ async def todo_toggle(sid, data):
                     userId=username,
                     householdId=household_id,
                     task=todo_model.title,
-                    completed='completed' if todo_model.completed else 'incomplete'
+                    completed='completed' if toggle_data.completed else 'incomplete'
                 ))
                 db.commit()
                 db.refresh(todo_model)
@@ -332,6 +422,8 @@ async def todo_toggle(sid, data):
                 # Broadcast to household room only
                 await sio.emit('todo:toggled', todo, room=f"household_{household_id}")
                 print(f"✅ Toggled todo: {todo['title']} -> {todo['completed']} (broadcast to household_{household_id})")
+                
+                # Note: Individual todo events handle the updates, no need for full state sync
             else:
                 await sio.emit('error', {'message': 'Todo not found'}, room=sid)
         finally:
@@ -342,7 +434,7 @@ async def todo_toggle(sid, data):
 
 @sio.on('todo:delete')
 async def todo_delete(sid, data):
-    """Soft delete a todo (mark Completed='deleted')"""
+    """Soft delete a todo (log as 'deleted' in Action table)"""
     try:
         print(f"🔍 Received todo_delete data: {data}")
         delete_data = TodoDeleteData(**data)
@@ -363,14 +455,21 @@ async def todo_delete(sid, data):
             # Find todo (no household filtering needed - rooms handle isolation)
             todo_model = db.query(TodoModel).filter(TodoModel.id == delete_data.id).first()
             if todo_model:
-                setattr(todo_model, 'Completed', 'deleted')
-                todo_model.updatedAt = datetime.utcnow()
+                # Log the soft delete action in Action table
+                db.add(ActionModel(
+                    id=str(uuid.uuid4()),
+                    userId=username,
+                    householdId=household_id,
+                    task=todo_model.title,
+                    completed='deleted'
+                ))
                 db.commit()
-                db.refresh(todo_model)
-                todo = db_todo_to_pydantic(todo_model)
+                
                 # Broadcast to household room only
-                await sio.emit('todo:updated', todo, room=f"household_{household_id}")
-                print(f"✅ Marked deleted todo: {delete_data.id} (broadcast to household_{household_id})")
+                await sio.emit('todo:deleted', {'id': delete_data.id}, room=f"household_{household_id}")
+                print(f"✅ Soft deleted todo: {delete_data.id} (logged in Action table, broadcast to household_{household_id})")
+                
+                # Note: Individual todo events handle the updates, no need for full state sync
             else:
                 await sio.emit('error', {'message': 'Todo not found'}, room=sid)
         finally:
@@ -415,6 +514,8 @@ async def todo_hard_delete(sid, data):
                 # Broadcast to household room only
                 await sio.emit('todo:deleted', {'id': delete_data.id}, room=f"household_{household_id}")
                 print(f"🗑️ Permanently deleted todo: {delete_data.id} (broadcast to household_{household_id})")
+                
+                # Note: Individual todo events handle the updates, no need for full state sync
             else:
                 await sio.emit('error', {'message': 'Todo not found'}, room=sid)
         finally:
@@ -446,14 +547,23 @@ async def todo_set_all(sid, data):
             # Get all todos for the household (rooms handle isolation, but we still need householdId for data integrity)
             todos = db.query(TodoModel).filter(TodoModel.householdId == household_id).all()
             for todo in todos:
-                todo.completed = set_all_data.completed
                 todo.updatedAt = datetime.utcnow()
+                # Log action for each todo
+                db.add(ActionModel(
+                    id=str(uuid.uuid4()),
+                    userId=username,
+                    householdId=household_id,
+                    task=todo.title,
+                    completed='completed' if set_all_data.completed else 'incomplete'
+                ))
             db.commit()
             
             # Emit updated todos to household room only
             updated_todos = [db_todo_to_pydantic(todo) for todo in todos]
             await sio.emit('todos:updated', updated_todos, room=f"household_{household_id}")
             print(f"✅ Set all todos to: {set_all_data.completed} (broadcast to household_{household_id})")
+            
+            # Note: Individual todo events handle the updates, no need for full state sync
         finally:
             db.close()
     except Exception as e:
@@ -479,9 +589,19 @@ async def todo_remove_completed(sid):
                 await sio.emit('error', {'message': 'You must join a household room first'}, room=sid)
                 return
                 
-            # Get completed todos for the household (rooms handle isolation, but we still need householdId for data integrity)
+            # Get completed todos for the household by checking Action table
+            from database import Action
+            completed_actions = db.query(Action).filter(
+                Action.completed == 'completed',
+                Action.householdId == household_id
+            ).all()
+            
+            # Get unique task names that are completed
+            completed_tasks = list(set([action.task for action in completed_actions]))
+            
+            # Find todos that match these completed tasks
             completed_todos = db.query(TodoModel).filter(
-                TodoModel.completed == True,
+                TodoModel.title.in_(completed_tasks),
                 TodoModel.householdId == household_id
             ).all()
             for todo in completed_todos:
@@ -491,10 +611,73 @@ async def todo_remove_completed(sid):
             # Broadcast to household room only
             await sio.emit('todos:completed_removed', {'count': len(completed_todos)}, room=f"household_{household_id}")
             print(f"✅ Removed {len(completed_todos)} completed todos (broadcast to household_{household_id})")
+            
+            # Note: Individual todo events handle the updates, no need for full state sync
         finally:
             db.close()
     except Exception as e:
         print(f"❌ Error in todo_remove_completed: {e}")
+        await sio.emit('error', {'message': str(e)}, room=sid)
+
+@sio.on('restart_day')
+async def restart_day(sid, data=None):
+    """Restart the day - refresh all todos for the household"""
+    try:
+        print(f"🔍 Received restart_day from sid: {sid}")
+        
+        db = next(get_db())
+        try:
+            username, household_id = await get_authenticated_user(sid)
+            if not username or not household_id:
+                await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+            
+            # Check if user is in a room
+            session = await sio.get_session(sid)
+            if not session.get('current_room'):
+                await sio.emit('error', {'message': 'You must join a household room first'}, room=sid)
+                return
+            
+            # Get all todos for the household directly from todos table
+            todos = db.query(TodoModel).filter(
+                TodoModel.householdId == household_id
+            ).all()
+            
+            # Convert todos to simple format without Action table logic
+            updated_todos = []
+            for todo in todos:
+                updated_todos.append({
+                    "id": todo.id,
+                    "title": todo.title,
+                    "completed": False,  # Reset to not completed
+                    "priority": todo.priority,
+                    "assigned_to": todo.assignedTo,
+                    "created_at": todo.createdAt.isoformat() if todo.createdAt else None,
+                    "updated_at": todo.updatedAt.isoformat() if todo.updatedAt else None,
+                    "ai_priority": None,
+                    "ai_reason": None,
+                    "Completed": None,
+                    "is_deleted": False  # Default to not deleted
+                })
+            
+            # Debug: Log the todos being sent
+            print(f"🔍 Todos being sent to household {household_id}:")
+            for i, todo in enumerate(updated_todos):
+                print(f"  {i+1}. {todo.get('title', 'No title')} (completed: {todo.get('completed', 'N/A')})")
+            
+            # Debug: Check room membership
+            room_name = f"household_{household_id}"
+            room_clients = list(sio.manager.get_participants(namespace='/', room=room_name))
+            print(f"🔍 Room {room_name} has {len(room_clients)} clients: {room_clients}")
+            
+            # Broadcast to household room only
+            await sio.emit('todos:restarted', updated_todos, room=room_name)
+            print(f"✅ Restarted day with {len(updated_todos)} todos (broadcast to {room_name})")
+            
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"❌ Error in restart_day: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
 
 if __name__ == "__main__":

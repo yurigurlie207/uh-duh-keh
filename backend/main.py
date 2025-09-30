@@ -35,18 +35,40 @@ from common.events import (
 auth_service = AuthService()
 
 # Helper function to convert database model to Pydantic model
-def db_todo_to_pydantic(db_todo: TodoModel) -> Todo:
+def db_todo_to_pydantic(db_todo: TodoModel, action_status=None) -> Todo:
     """Convert database Todo model to Pydantic Todo model"""
+    # If action_status is provided, use it; otherwise query the database
+    if action_status is not None:
+        is_deleted = action_status == 'deleted'
+        is_completed = action_status == 'completed'
+    else:
+        # Check if todo is soft-deleted by looking at Action table
+        from database import Action
+        db = next(get_db())
+        try:
+            # Get the latest action for this todo to determine if it's deleted
+            latest_action = db.query(Action).filter(
+                Action.task == db_todo.title,
+                Action.householdId == db_todo.householdId
+            ).order_by(Action.dateTime.desc()).first()
+            
+            is_deleted = latest_action and latest_action.completed == 'deleted'
+            is_completed = latest_action and latest_action.completed == 'completed'
+        finally:
+            db.close()
+    
     return Todo(
         id=db_todo.id,
         title=db_todo.title,
-        completed=db_todo.completed,
+        completed=is_completed,
         priority=db_todo.priority,
         assigned_to=db_todo.assignedTo,
         created_at=db_todo.createdAt.isoformat() if db_todo.createdAt else None,
         updated_at=db_todo.updatedAt.isoformat() if db_todo.updatedAt else None,
         ai_priority=None,  # Column doesn't exist in your database
-        ai_reason=None     # Column doesn't exist in your database
+        ai_reason=None,    # Column doesn't exist in your database
+        Completed='deleted' if is_deleted else ('completed' if is_completed else None),
+        is_deleted=is_deleted  # Add explicit deleted flag for frontend
     )
 
 security = HTTPBearer()
@@ -106,9 +128,31 @@ async def get_todos(current_user: tuple = Depends(get_current_user)):
     username, household_id = current_user
     db = next(get_db())
     try:
-        # Filter by household_id for REST API (rooms handle Socket.IO isolation)
-        todos = db.query(TodoModel).filter(TodoModel.householdId == household_id).all()
-        return [db_todo_to_pydantic(todo) for todo in todos]
+        # Get all todos for the household
+        todos = db.query(TodoModel).filter(
+            TodoModel.householdId == household_id
+        ).all()
+        
+        # Get all actions for the household to determine status
+        from database import Action
+        all_actions = db.query(Action).filter(
+            Action.householdId == household_id
+        ).order_by(Action.dateTime.desc()).all()
+        
+        # Create a map of task -> latest action status
+        task_status_map = {}
+        for action in all_actions:
+            if action.task not in task_status_map:
+                task_status_map[action.task] = action.completed
+        
+        # Filter out soft-deleted todos and convert to Pydantic models
+        result_todos = []
+        for todo in todos:
+            task_status = task_status_map.get(todo.title)
+            if task_status != 'deleted':  # Only include non-deleted todos
+                result_todos.append(db_todo_to_pydantic(todo, task_status))
+        
+        return result_todos
     finally:
         db.close()
 

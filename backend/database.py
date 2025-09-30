@@ -39,15 +39,12 @@ class Todo(Base):
     
     id = Column(String, primary_key=True, index=True)
     title = Column(String, nullable=False)
-    completed = Column(Boolean, default=False)
     priority = Column(String, default="999")
     assignedTo = Column("assignedTo", String, nullable=True)
     createdBy = Column("createdBy", String, nullable=False)
     householdId = Column("householdId", String, nullable=False)
     createdAt = Column("createdAt", DateTime, default=datetime.utcnow)
     updatedAt = Column("updatedAt", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    # New soft-status column to track 'completed' or 'deleted'
-    Completed = Column("Completed", String, nullable=True)
     # Note: aiPriority and aiReason columns don't exist in your database
     # aiPriority = Column("aiPriority", Integer, nullable=True)
     # aiReason = Column("aiReason", Text, nullable=True)
@@ -108,6 +105,53 @@ def get_db():
 # Create all tables
 def create_tables():
     Base.metadata.create_all(bind=engine)
+    
+    # Migration: Remove completed column from todos table
+    _remove_completed_column()
+    # Migration: Remove Completed status column from todos table
+    _remove_completed_status_column()
+
+def _remove_completed_column():
+    """Remove the completed column from todos table if it exists"""
+    try:
+        with engine.connect() as conn:
+            # Check if completed column exists
+            result = conn.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'todos' AND column_name = 'completed'
+            """))
+            if result.fetchone():
+                print("🗑️ Removing completed column from todos table...")
+                conn.execute(text('ALTER TABLE todos DROP COLUMN IF EXISTS completed'))
+                conn.commit()
+                print("✅ Completed column removed successfully")
+            else:
+                print("ℹ️ Completed column does not exist, skipping removal")
+    except Exception as e:
+        print(f"⚠️ Error removing completed column: {e}")
+        # Don't fail the application if migration fails
+
+def _remove_completed_status_column():
+    """Remove the Completed column from todos table if it exists"""
+    try:
+        with engine.connect() as conn:
+            # Check if Completed column exists
+            result = conn.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'todos' AND column_name = 'Completed'
+            """))
+            if result.fetchone():
+                print("🗑️ Removing Completed column from todos table...")
+                conn.execute(text('ALTER TABLE todos DROP COLUMN IF EXISTS "Completed"'))
+                conn.commit()
+                print("✅ Completed status column removed successfully")
+            else:
+                print("ℹ️ Completed status column does not exist, skipping removal")
+    except Exception as e:
+        print(f"⚠️ Error removing Completed column: {e}")
+        # Don't fail the application if migration fails
 
 # Attempt to add the Completed column if it doesn't exist (basic runtime migration)
 def _ensure_completed_column():
