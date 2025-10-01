@@ -171,14 +171,21 @@ async def connect(sid, environ, auth=None):
             print(f"=" * 80)
             
             # Store user info in session (you can access this in other event handlers)
-            await sio.save_session(sid, {'username': username, 'household_id': household_id, 'authenticated': True})
+            session = {'username': username, 'household_id': household_id, 'authenticated': True}
+            await sio.save_session(sid, session)
             print(f"💾 Session saved for {username}: {{'username': '{username}', 'household_id': '{household_id}', 'authenticated': True}}")
 
-            # Don't automatically join a room - let user choose
-            print(f"🔐 User {username} authenticated but not in any room yet")
+            # Automatically join the user's household room so they are always part of it
+            room_name = get_room_name(household_id)
+            await sio.enter_room(sid, room_name)
+            session['current_room'] = room_name
+            await sio.save_session(sid, session)
+            print(f"🏠 Auto-joined user {username} to household room: {room_name}")
 
-            # Do not emit a 'connect' event here (reserved by protocol). If needed, emit a custom event.
-            # await sio.emit('server:welcome', {'message': f'Connected as {username}!'}, room=sid)
+            # Notify room that user is online and send current state to this user
+            await sio.emit('user:online', {'username': username}, room=room_name)
+            await send_current_state(sid, household_id)
+
             return True  # Accept connection
             
         except Exception as auth_error:

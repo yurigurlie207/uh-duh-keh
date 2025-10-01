@@ -5,7 +5,7 @@ import os
 import sys
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -153,6 +153,102 @@ async def get_todos(current_user: tuple = Depends(get_current_user)):
                 result_todos.append(db_todo_to_pydantic(todo, task_status))
         
         return result_todos
+    finally:
+        db.close()
+
+@app.get("/api/analytics/week")
+async def get_weekly_analytics(
+    offsetDays: int = Query(0, description="Offset the 7-day window by this many days; negative for past"),
+    current_user: tuple = Depends(get_current_user)
+):
+    """Aggregate actions for a 7-day window for the user's household.
+    The window starts at (now - 7 days + offsetDays) and spans 7 days.
+    """
+    username, jwt_household_id = current_user
+    db = next(get_db())
+    try:
+        from database import Action, User as UserModel
+        # Resolve authoritative household_id via Users table for the current username
+        effective_household_id = jwt_household_id
+        try:
+            user_row = db.query(UserModel).filter(UserModel.username == username).first()
+            if user_row and user_row.householdId:
+                effective_household_id = user_row.householdId
+        except Exception:
+            # Fall back to JWT household if lookup fails
+            effective_household_id = jwt_household_id
+        
+        from database import Action
+        now = datetime.utcnow()
+        # Define a 7-day window starting on Monday (ISO), including that full week
+        # Compute this week's Monday in UTC date, then apply offsetDays
+        today_date = now.date()
+        monday = today_date - timedelta(days=today_date.weekday())  # Monday == 0
+        base_start_date = monday + timedelta(days=offsetDays)
+        start = datetime.combine(base_start_date, datetime.min.time())
+        end = start + timedelta(days=7)
+        actions = db.query(Action).filter(
+            Action.householdId == effective_household_id,
+            Action.dateTime >= start,
+            Action.dateTime < end
+        ).all()
+
+        # Initialize structures
+        statuses = ["created", "completed", "deleted", "incomplete"]
+        totals_by_status = {s: 0 for s in statuses}
+        daily = {}
+        by_user = {}
+        by_user_by_day = {}
+
+        def date_key(dt: datetime) -> str:
+            return dt.strftime("%Y-%m-%d")
+
+        # seed daily for each day (7 days inclusive of today)
+        dates = []
+        for i in range(7):
+            d = (start + timedelta(days=i)).strftime("%Y-%m-%d")
+            dates.append(d)
+            daily[d] = {s: 0 for s in statuses}
+
+        for a in actions:
+            status = (a.completed or "").lower()
+            if status not in totals_by_status:
+                # ignore unknown statuses but track under 'incomplete' if empty
+                status = "incomplete" if status == "" else None
+            if status:
+                totals_by_status[status] += 1
+                dk = date_key(a.dateTime)
+                if dk not in daily:
+                    daily[dk] = {s: 0 for s in statuses}
+                daily[dk][status] += 1
+                by_user.setdefault(a.userId, {s: 0 for s in statuses})
+                by_user[a.userId][status] += 1
+                # per-user per-day
+                if a.userId not in by_user_by_day:
+                    by_user_by_day[a.userId] = {}
+                if dk not in by_user_by_day[a.userId]:
+                    by_user_by_day[a.userId][dk] = {s: 0 for s in statuses}
+                by_user_by_day[a.userId][dk][status] += 1
+
+        # to arrays for frontend
+        daily_array = [
+            {"date": d, **counts} for d, counts in sorted(daily.items(), key=lambda x: x[0])
+        ]
+        by_user_array = [
+            {"username": u, **counts} for u, counts in sorted(by_user.items(), key=lambda x: sum(x[1].values()), reverse=True)
+        ]
+
+        return {
+            "household_id": effective_household_id,
+            "from": start.isoformat() + "Z",
+            "to": end.isoformat() + "Z",
+            "totalsByStatus": totals_by_status,
+            "daily": daily_array,
+            "byUser": by_user_array,
+            "byUserByDay": by_user_by_day,
+            "dates": dates,
+            "count": len(actions)
+        }
     finally:
         db.close()
 

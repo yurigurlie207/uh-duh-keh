@@ -146,3 +146,4 @@ socket.on('error', (error) => {
 
 This approach gives users explicit control over their room membership while maintaining security and providing clear feedback about their connection status.
 
+
