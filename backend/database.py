@@ -94,6 +94,17 @@ class JoinRequest(Base):
     createdAt = Column("createdAt", DateTime, default=datetime.utcnow)
     updatedAt = Column("updatedAt", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+# Household timer state for synchronized countdown
+class HouseholdTimer(Base):
+    __tablename__ = "household_timers"
+
+    householdId = Column(String, primary_key=True, index=True)
+    targetTime = Column("targetTime", DateTime, nullable=True)  # When to be out the door
+    isActive = Column("isActive", Boolean, default=False)  # Whether timer is running
+    setBy = Column("setBy", String, nullable=False)  # Username who set the timer
+    createdAt = Column("createdAt", DateTime, default=datetime.utcnow)
+    updatedAt = Column("updatedAt", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 # Database dependency
 def get_db():
     db = SessionLocal()

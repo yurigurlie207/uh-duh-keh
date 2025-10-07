@@ -15,7 +15,7 @@ load_dotenv()
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import socketio
-from database import get_db, Todo as TodoModel, Action as ActionModel, Household, JoinRequest as JoinRequestModel
+from database import get_db, Todo as TodoModel, Action as ActionModel, Household, JoinRequest as JoinRequestModel, HouseholdTimer
 from common.events import TodoCreateData, TodoUpdateData, TodoToggleData, TodoDeleteData, TodoSetAllData
 from auth import AuthService
 
@@ -127,11 +127,22 @@ async def send_current_state(sid, household_id):
             users = db.query(User).filter(User.householdId == household_id).all()
             users_data = [{"username": user.username} for user in users]
             
+            # Get current timer state for this household
+            timer = db.query(HouseholdTimer).filter(HouseholdTimer.householdId == household_id).first()
+            timer_data = None
+            if timer and timer.isActive:
+                timer_data = {
+                    'targetTime': timer.targetTime.isoformat() if timer.targetTime else None,
+                    'isActive': timer.isActive,
+                    'setBy': timer.setBy
+                }
+            
             # Send state to the specific user
             await sio.emit('state_sync', {
                 'todos': todos_data,
                 'users': users_data,
-                'household_id': household_id
+                'household_id': household_id,
+                'timer': timer_data
             }, room=sid)
             
             print(f"📤 Sent current state to user: {len(todos_data)} todos, {len(users_data)} users")
@@ -772,6 +783,158 @@ async def restart_day(sid, data=None):
             db.close()
     except Exception as e:
         print(f"❌ Error in restart_day: {e}")
+        await sio.emit('error', {'message': str(e)}, room=sid)
+
+@sio.on('timer:set')
+async def timer_set(sid, data):
+    """Set the household timer (time out the door)"""
+    try:
+        print(f"🔍 Received timer:set from sid: {sid}, data: {data}")
+        
+        db = next(get_db())
+        try:
+            username, household_id = await get_authenticated_user(sid)
+            if not username or not household_id:
+                await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+            
+            # Check if user is in a room
+            session = await sio.get_session(sid)
+            if not session.get('current_room'):
+                await sio.emit('error', {'message': 'You must join a household room first'}, room=sid)
+                return
+            
+            target_time_str = data.get('targetTime')
+            if not target_time_str:
+                await sio.emit('error', {'message': 'targetTime is required'}, room=sid)
+                return
+            
+            # Parse the target time
+            target_time = datetime.fromisoformat(target_time_str.replace('Z', '+00:00'))
+            
+            # Update or create household timer
+            timer = db.query(HouseholdTimer).filter(HouseholdTimer.householdId == household_id).first()
+            if timer:
+                timer.targetTime = target_time
+                timer.isActive = True
+                timer.setBy = username
+                timer.updatedAt = datetime.utcnow()
+            else:
+                timer = HouseholdTimer(
+                    householdId=household_id,
+                    targetTime=target_time,
+                    isActive=True,
+                    setBy=username
+                )
+                db.add(timer)
+            
+            db.commit()
+            
+            # Broadcast timer update to household room
+            room_name = get_room_name(household_id)
+            timer_data = {
+                'targetTime': target_time.isoformat(),
+                'isActive': True,
+                'setBy': username,
+                'householdId': household_id
+            }
+            await sio.emit('timer:updated', timer_data, room=room_name)
+            print(f"✅ Timer set by {username} for household {household_id}: {target_time}")
+            
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"❌ Error in timer_set: {e}")
+        await sio.emit('error', {'message': str(e)}, room=sid)
+
+@sio.on('timer:stop')
+async def timer_stop(sid, data):
+    """Stop the household timer"""
+    try:
+        print(f"🔍 Received timer:stop from sid: {sid}")
+        
+        db = next(get_db())
+        try:
+            username, household_id = await get_authenticated_user(sid)
+            if not username or not household_id:
+                await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+            
+            # Check if user is in a room
+            session = await sio.get_session(sid)
+            if not session.get('current_room'):
+                await sio.emit('error', {'message': 'You must join a household room first'}, room=sid)
+                return
+            
+            # Update household timer
+            timer = db.query(HouseholdTimer).filter(HouseholdTimer.householdId == household_id).first()
+            if timer:
+                timer.isActive = False
+                timer.targetTime = None
+                timer.setBy = username
+                timer.updatedAt = datetime.utcnow()
+                db.commit()
+            
+            # Broadcast timer stop to household room
+            room_name = get_room_name(household_id)
+            timer_data = {
+                'targetTime': None,
+                'isActive': False,
+                'setBy': username,
+                'householdId': household_id
+            }
+            await sio.emit('timer:updated', timer_data, room=room_name)
+            print(f"✅ Timer stopped by {username} for household {household_id}")
+            print(f"📤 Broadcasting timer:updated to room {room_name}: {timer_data}")
+            
+            # Debug: Check who's in the room
+            room_clients = list(sio.manager.get_participants(namespace='/', room=room_name))
+            print(f"🔍 Room {room_name} has {len(room_clients)} clients: {room_clients}")
+            
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"❌ Error in timer_stop: {e}")
+        await sio.emit('error', {'message': str(e)}, room=sid)
+
+@sio.on('timer:get')
+async def timer_get(sid, data):
+    """Get the current household timer state"""
+    try:
+        print(f"🔍 Received timer:get from sid: {sid}")
+        
+        db = next(get_db())
+        try:
+            username, household_id = await get_authenticated_user(sid)
+            if not username or not household_id:
+                await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+                return
+            
+            # Get current timer state
+            timer = db.query(HouseholdTimer).filter(HouseholdTimer.householdId == household_id).first()
+            if timer and timer.isActive:
+                timer_data = {
+                    'targetTime': timer.targetTime.isoformat() if timer.targetTime else None,
+                    'isActive': timer.isActive,
+                    'setBy': timer.setBy,
+                    'householdId': household_id
+                }
+            else:
+                timer_data = {
+                    'targetTime': None,
+                    'isActive': False,
+                    'setBy': None,
+                    'householdId': household_id
+                }
+            
+            # Send timer state to requesting user
+            await sio.emit('timer:state', timer_data, room=sid)
+            print(f"✅ Sent timer state to {username}: {timer_data}")
+            
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"❌ Error in timer_get: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
 
 if __name__ == "__main__":
