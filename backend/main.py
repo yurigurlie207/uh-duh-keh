@@ -156,6 +156,56 @@ async def get_todos(current_user: tuple = Depends(get_current_user)):
     finally:
         db.close()
 
+@app.post("/api/users/{username}/admin")
+async def set_user_admin(username: str, make_admin: bool = Query(...), current_user: tuple = Depends(get_current_user)):
+    """Grant or revoke admin permissions for a user in the same household. Only admins can call this."""
+    caller_username, caller_household = current_user
+    db = next(get_db())
+    try:
+        caller = db.query(User).filter(User.username == caller_username).first()
+        if not caller or not getattr(caller, 'isAdmin', False):
+            raise HTTPException(status_code=403, detail="admin access required")
+        target = db.query(User).filter(User.username == username, User.householdId == caller_household).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="user not found in household")
+        target.isAdmin = bool(make_admin)
+        target.updatedAt = datetime.utcnow()
+        db.commit()
+        # Notify socket clients to refresh members
+        try:
+            import httpx
+            socket_base = os.getenv('SOCKET_SERVER_URL', 'http://localhost:3002')
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(f"{socket_base}/households/{caller_household}/members/updated", json={"event": "admin_changed", "username": username, "is_admin": make_admin})
+        except Exception:
+            pass
+        return {"username": username, "is_admin": bool(make_admin)}
+    finally:
+        db.close()
+
+@app.delete("/api/me")
+async def delete_me(current_user: tuple = Depends(get_current_user)):
+    """Delete the currently authenticated user account."""
+    username, household_id = current_user
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="user not found")
+        db.delete(user)
+        db.commit()
+        # Notify socket server that members list changed
+        try:
+            import httpx
+            socket_base = os.getenv('SOCKET_SERVER_URL', 'http://localhost:3002')
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(f"{socket_base}/households/{household_id}/members/updated", json={"event": "deleted", "username": username})
+        except Exception:
+            pass
+        return {"message": "account deleted"}
+    finally:
+        db.close()
+
 @app.get("/api/analytics/week")
 async def get_weekly_analytics(
     offsetDays: int = Query(0, description="Offset the 7-day window by this many days; negative for past"),
@@ -297,10 +347,10 @@ async def get_users(current_user: tuple = Depends(get_current_user)):
         
         return [
             {
-                "username": user.username, 
-                "is_admin": user.isAdmin or False,
+                "username": user.username,
+                "is_admin": bool(getattr(user, 'isAdmin', False)),
                 "is_online": user.username in online_users
-            } 
+            }
             for user in users
         ]
     finally:
@@ -555,12 +605,28 @@ async def approve_join_request(household_id: str, request_id: str, current_user:
         target = db.query(User).filter(User.username == jr.username).first()
         if not target:
             raise HTTPException(status_code=404, detail="target user not found")
+        # Move user to the new household
         target.householdId = household_id
+        # Admin rule: only the first member of a household is admin by default
+        # If the destination household already has an admin, demote this user to non-admin.
+        # If no admin exists yet (first member), grant admin.
+        # When joining a new household, always set to non-admin
+        # Admin status can be granted later by existing admins if needed
+        target.isAdmin = False
         target.updatedAt = datetime.utcnow()
         jr.status = "approved"
         jr.updatedAt = datetime.utcnow()
         db.commit()
         h = db.query(Household).filter(Household.id == household_id).first()
+        # Notify socket server that members list changed
+        try:
+            import httpx
+            socket_base = os.getenv('SOCKET_SERVER_URL', 'http://localhost:3002')
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(f"{socket_base}/households/{household_id}/members/updated", json={"event": "approved", "username": target.username})
+                await client.post(f"{socket_base}/households/{household_id}/user-approved", json={"username": target.username})
+        except Exception:
+            pass
         return {"message": "Request approved", "username": target.username, "household_id": household_id, "household_name": h.name if h else None}
     finally:
         db.close()

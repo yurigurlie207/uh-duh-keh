@@ -15,7 +15,7 @@ load_dotenv()
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import socketio
-from database import get_db, Todo as TodoModel, Action as ActionModel, Household
+from database import get_db, Todo as TodoModel, Action as ActionModel, Household, JoinRequest as JoinRequestModel
 from common.events import TodoCreateData, TodoUpdateData, TodoToggleData, TodoDeleteData, TodoSetAllData
 from auth import AuthService
 
@@ -282,6 +282,77 @@ async def join_household(sid, data):
         
     except Exception as e:
         print(f"❌ Error in join_household: {e}")
+        await sio.emit('error', {'message': str(e)}, room=sid)
+
+@sio.on('household:join_request')
+async def household_join_request(sid, data):
+    """User requests to join a household; save request and notify room admins immediately."""
+    try:
+        # Require auth
+        username, user_household_id = await get_authenticated_user(sid)
+        if not username:
+            await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+            return
+
+        target_household_id = data.get('household_id')
+        target_household_name = data.get('household_name')
+
+        # Resolve name -> id if needed
+        if not target_household_id and target_household_name:
+            db = next(get_db())
+            try:
+                h = db.query(Household).filter(Household.name == target_household_name).first()
+                if h:
+                    target_household_id = h.id
+            finally:
+                db.close()
+
+        if not target_household_id:
+            await sio.emit('error', {'message': 'household_id is required'}, room=sid)
+            return
+
+        # Persist request if not already pending
+        db = next(get_db())
+        try:
+            existing = db.query(JoinRequestModel).filter(
+                JoinRequestModel.username == username,
+                JoinRequestModel.householdId == target_household_id,
+                JoinRequestModel.status == 'pending'
+            ).first()
+            if not existing:
+                jr = JoinRequestModel(
+                    id=str(uuid.uuid4()),
+                    username=username,
+                    householdId=target_household_id,
+                    status='pending',
+                )
+                db.add(jr)
+                db.commit()
+
+            # Notify only the admin (first/earliest member) in the target household
+            room_name = get_room_name(target_household_id)
+            payload = { 'username': username, 'household_id': target_household_id }
+            try:
+                from database import User as UserModel
+                admin_user = db.query(UserModel).filter(UserModel.householdId == target_household_id).order_by(UserModel.createdAt.asc()).first()
+                if admin_user:
+                    participants = list(sio.manager.get_participants(namespace='/', room=room_name))
+                    for p in participants:
+                        sid_in_room = p[0] if isinstance(p, tuple) else p
+                        try:
+                            sess = await sio.get_session(sid_in_room)
+                            if sess and sess.get('username') == admin_user.username:
+                                await sio.emit('household:join_request:created', payload, room=sid_in_room)
+                        except Exception:
+                            pass
+            except Exception:
+                # Fallback: do not broadcast to all
+                pass
+            await sio.emit('ok', {'message': 'join request sent'}, room=sid)
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"❌ Error in household:join_request: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
 
 @sio.on('todo:create')
@@ -705,12 +776,38 @@ async def restart_day(sid, data=None):
 
 if __name__ == "__main__":
     import uvicorn
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Body
     from starlette.responses import JSONResponse
     from starlette.routing import Mount
     
     # Create a minimal FastAPI app for Socket.IO
     app = FastAPI()
+
+    @app.post("/households/{household_id}/members/updated")
+    async def members_updated(household_id: str, payload: dict = Body(default={})):  # HTTP hook from main API
+        try:
+            room_name = get_room_name(household_id)
+            await sio.emit('household:members_updated', payload or {}, room=room_name)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/households/{household_id}/user-approved")
+    async def user_approved(household_id: str, payload: dict = Body(default={})):  # Notify target user to rejoin
+        try:
+            username = payload.get('username')
+            # Broadcast an approval notice; clients verify if it's about them
+            await sio.emit('household:user_approved', {
+                'username': username,
+                'household_id': household_id
+            })
+            # Also notify the destination room so admins refresh
+            await sio.emit('household:members_updated', {
+                'event': 'approved', 'username': username
+            }, room=get_room_name(household_id))
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
     
     # Add endpoint to get online users for a household (BEFORE mounting Socket.IO)
     @app.get("/online-users/{household_id}")
