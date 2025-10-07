@@ -287,12 +287,63 @@ async def join_household(sid, data):
         room_clients = list(sio.manager.get_participants(namespace='/', room=room_name))
         print(f"🔍 After joining, room {room_name} has {len(room_clients)} clients: {room_clients}")
         
-        # Send current state to the newly joined user
-        print(f"📤 Sending current state to newly joined user {username}")
-        await send_current_state(sid, requested_household_id)
+        # If there are already participants in the room, request a live snapshot
+        # from one existing client to ensure the latest on-screen state
+        try:
+            participants = list(sio.manager.get_participants(namespace='/', room=room_name))
+        except TypeError:
+            # Fallback for older socketio versions argument order
+            participants = list(sio.manager.get_participants(room_name, namespace='/'))
+
+        # Normalize to plain sid strings (some versions return tuples)
+        norm_participants = []
+        for p in participants:
+            if isinstance(p, (list, tuple)) and len(p) > 0:
+                norm_participants.append(p[0])
+            else:
+                norm_participants.append(p)
+
+        # Choose any existing client other than the joining sid
+        existing_others = [p for p in norm_participants if p != sid]
+        if existing_others:
+            source_sid = existing_others[0]
+            print(f"📤 Requesting state snapshot from existing client {source_sid} for new sid {sid}")
+            await sio.emit('state:request_snapshot', { 'targetSid': sid }, room=source_sid)
+        else:
+            # No other clients to provide a snapshot; fall back to server state
+            print(f"📤 No existing clients in room; sending server state to {username}")
+            await send_current_state(sid, requested_household_id)
         
     except Exception as e:
         print(f"❌ Error in join_household: {e}")
+        await sio.emit('error', {'message': str(e)}, room=sid)
+
+@sio.on('state:snapshot')
+async def state_snapshot(sid, data):
+    """Receive a live UI snapshot from an existing client and forward to a target sid."""
+    try:
+        username, household_id = await get_authenticated_user(sid)
+        if not username or not household_id:
+            await sio.emit('auth_error', {'message': 'Not authenticated'}, room=sid)
+            return
+
+        target_sid = data.get('targetSid')
+        todos = data.get('todos') or []
+        timer = data.get('timer') or None
+        if not target_sid:
+            await sio.emit('error', {'message': 'targetSid is required for state forwarding'}, room=sid)
+            return
+
+        payload = {
+            'todos': todos,
+            'users': [],
+            'household_id': household_id,
+            'timer': timer
+        }
+        print(f"📤 Forwarding client-provided snapshot from {sid} to {target_sid}: todos={len(todos)}")
+        await sio.emit('state_sync', payload, room=target_sid)
+    except Exception as e:
+        print(f"❌ Error in state_snapshot: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
 
 @sio.on('household:join_request')
