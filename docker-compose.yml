@@ -1,0 +1,68 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: todo_db
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "user"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.api
+    environment:
+      DATABASE_URL: postgresql://user:password@db:5432/todo_db
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "3001"
+
+  socket:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.socket
+    environment:
+      DATABASE_URL: postgresql://user:password@db:5432/todo_db
+      CORS_ALLOWED_ORIGINS: "*"
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "3002"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      # The proxy serves API at /api and socket at /socket.io on same origin
+      REACT_APP_API_URL: "/api"
+    expose:
+      - "80"
+
+  proxy:
+    build:
+      context: ./reverse-proxy
+    ports:
+      - "80:80"
+    depends_on:
+      - frontend
+      - backend
+      - socket
+
+volumes:
+  db_data:
+
+
